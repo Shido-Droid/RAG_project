@@ -4,6 +4,7 @@
   "service": "python",
   "dockerComposeFile": "./compose.yml",
   "workspaceFolder": "/home/vscode/python",
+  "runServices": ["ollama"],
   "postCreateCommand": "uv sync --all-groups",
   "customizations": {
     "vscode": {

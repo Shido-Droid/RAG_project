@@ -51,6 +51,13 @@ VS CodeのDev Container機能利用を前提としており、誰でも一貫し
 
 4.  **完了！**
     VS Codeが自動的にDockerコンテナのビルドと開発環境のセットアップを開始します。初回は数分かかることがあります。完了すると、VS Codeがコンテナに接続された状態になり、開発を始めることができます。
+    まとめ
+    1. ターミナルで git clone https://github.com/Shido-Droid/RAG_project.git
+    　を実行して、プロジェクトをダウンロードします。
+   2. VS Codeで、ダウンロードした RAG_project フォル　　ダを開きます。
+   3. VS Codeの右下に「Reopen in
+      Container」という通知が表示されたら、そのボタンをクリックします。
+
 
 ---
 
