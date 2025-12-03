@@ -3,7 +3,7 @@
   "name": "uv-python",
   "service": "python",
   "dockerComposeFile": "./compose.yml",
-  "workspaceFolder": "/home/vscode/python",
+  "workspaceFolder": "/home/vscode/python/RAG_project",
   "postCreateCommand": "uv sync --all-groups",
   "customizations": {
     "vscode": {
