@@ -1,4 +1,4 @@
-# scripts/rag_qwen_ultimate_v2.py
+# scripts/rag_qwen_ultimate.py
 """
 Ultimate RAG v2 (improved)
 - Qwen による検索意図判定 + 意図に応じたクエリ生成
@@ -10,6 +10,7 @@ Ultimate RAG v2 (improved)
 - エラーハンドリング強化、verbose ログあり
 """
 import os
+import sys
 import time
 import json
 import re
@@ -45,6 +46,13 @@ except Exception:
 # -----------------------
 # Config
 # -----------------------
+from enum import Enum
+
+class AnswerMode(Enum):
+    NO_CONTEXT = "no_context"
+    FAST_FACT = "fast_fact"
+    CONTEXT_QA = "context_qa"
+
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://10.23.130.252:1234/v1/chat/completions")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen2.5-7b-instruct")
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -54,24 +62,28 @@ CHARS_LIMIT = TOKENS_LIMIT * 4
 DDGS_MAX_PER_QUERY = 8
 DDGS_USE_NEWS = True
 NUM_SEARCH_QUERIES = 4           # reduced
-WEB_DOCS_TO_SUMMARIZE = 5        # reduced to speed up
+WEB_DOCS_TO_SUMMARIZE = 2        # reduced to speed up
 VERBOSE = True
 REQUESTS_TIMEOUT = 8            # HTTP timeout
-LM_TIMEOUT = 30                 # LM HTTP timeout (seconds)
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-# ---------- 上部の Config / 定数に追加・変更（置き換え） ----------
-# 既存の定数の近くに追加してください
 LM_TIMEOUT = int(os.environ.get("LM_TIMEOUT", "60"))   # デフォルト LM タイムアウト（秒） — 最終パイプ用は長め
 LM_SHORT_TIMEOUT = int(os.environ.get("LM_SHORT_TIMEOUT", "12"))  # クエリ生成など短い操作用
 LM_RETRIES = int(os.environ.get("LM_RETRIES", "1"))   # リトライ 1 回（合計2回）
-# Reduce summarization batch to avoid long waits
-WEB_DOCS_TO_SUMMARIZE = 2  # ← 要約するドキュメント数を減らす
-NUM_SEARCH_QUERIES = 4    # 初期クエリ数（すでに反映されていればOK）
-# ------------------------------------------------------------------
+PRIORITY_DOMAINS = [
+    "tabelog.com",
+    "retty.me",
+    "gnavi.co.jp",
+    "hotpepper.jp",
+]
 
-# priority / boost tokens (for restaurant-ish scoring; still used but less dominant)
-PRIORITY_DOMAINS = ["tabelog.com", "retty.me", "hotpepper.jp", "jalan.net", "tripadvisor", "yelp", "gurunavi"]
-BOOST_KEYWORDS = ["店", "営業時間", "住所", "ランチ", "ディナー", "口コミ", "評価", "レビュー"]
+BOOST_KEYWORDS = [
+    "営業時間",
+    "ランチ",
+    "口コミ",
+    "評価",
+    "住所",
+    "電話",
+]
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 
 # -----------------------
 # Init models (may be slow)
@@ -92,6 +104,54 @@ def safe_json_load(s: str):
         return json.loads(s)
     except Exception:
         return None
+    
+# -----------------------
+# FAST PATH utilities
+# -----------------------
+def try_fast_path(question: str) -> str | None:
+    # --- 正規化 ---
+    q = question.strip()
+
+    # 全角 → 半角
+    trans = str.maketrans({
+        "０":"0","１":"1","２":"2","３":"3","４":"4",
+        "５":"5","６":"6","７":"7","８":"8","９":"9",
+        "＋":"+","－":"-","＊":"*","×":"*","÷":"/",
+        "（":"(","）":")"
+    })
+    q = q.translate(trans)
+
+    # 日本語助詞・疑問符など除去
+    q = re.sub(r"[=は？\?を]", "", q)
+    q = q.replace(" ", "").replace("　", "")
+
+    # --- 四則演算 ---
+    if re.fullmatch(r"[0-9+\-*/().]+", q):
+        try:
+            return str(eval(q, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
+
+    # --- 現在時刻 ---
+    if any(k in question for k in ["現在の時刻", "今何時", "今の時間", "今の時刻", "現在時刻", "何時です"]):
+        import datetime
+        now = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=9))
+        )
+        return f"現在の日本時刻は {now.strftime('%H時%M分')} です。"
+
+    # --- 超常識 ---
+    COMMON = {
+        "日本の首都": "日本の首都は東京です。",
+        "1日は何時間": "1日は24時間です。",
+        "1年は何日": "通常の年は365日、うるう年は366日です。",
+    }
+    for k, v in COMMON.items():
+        if k in q:
+            return v
+
+    return None
+
 
 # -----------------------
 # LMStudio wrapper
@@ -154,7 +214,10 @@ def detect_search_intent(question: str) -> str:
       - contains 'ニュース', '最新', '発表' -> news
       - else informational
     """
-    system = "You are a concise intent classifier for search queries. Respond with a single token: informational / local_search / news / other."
+    system = (
+    "Classify intent: informational / spec / factual / local_search / news / other"
+    )
+
     user = f"ユーザーの質問（日本語）: {question}\n\nReturn one of: informational, local_search, news, other"
     try:
         resp = lmstudio_chat(
@@ -176,19 +239,22 @@ def detect_search_intent(question: str) -> str:
     local_tokens = ["近く", "ランチ", "店", "レストラン", "営業時間", "おいしい", "予約"]
     news_tokens = ["ニュース", "発表", "速報", "昨日", "今日"]
     info_tokens = ["なぜ", "どうやって", "いつ", "とは", "教えて", "標高", "定義", "意味"]
+    spec_tokens = ["バージョン", "仕様", "対応", "api", "model", "release"]
+
     if any(tok in qlow for tok in local_tokens):
         return "local_search"
     if any(tok in qlow for tok in news_tokens):
         return "news"
     if any(tok in qlow for tok in info_tokens):
         return "informational"
+    if any(tok in qlow for tok in spec_tokens):
+        return "spec"
     return "informational"
 
 # -----------------------
 # 1) Query generation (intent-aware)
 # -----------------------
-def qwen_generate_search_queries(question: str, n: int = NUM_SEARCH_QUERIES) -> List[str]:
-    intent = detect_search_intent(question)
+def qwen_generate_search_queries(question: str, intent: str, n: int = NUM_SEARCH_QUERIES) -> List[str]:
     log("[Search Intent]", intent)
     # build a system prompt tailored by intent
     if intent == "local_search":
@@ -200,9 +266,11 @@ def qwen_generate_search_queries(question: str, n: int = NUM_SEARCH_QUERIES) -> 
     elif intent == "informational":
         sys_prompt = (
         "You are a search-query generator for factual informational search (Japanese). "
+        "If the query is an acronym or ambiguous, add context (e.g. 'AI', 'IT', '意味') or expand it. "
         "DO NOT add restaurant, food, travel, or local business related terms unless explicitly asked."
         )
         extra_instruction = "- Use factual terms only (definitions, numbers, official data)."
+        extra_instruction = "- Use factual terms. Expand acronyms if ambiguous."
     elif intent == "recommendation":
         sys_prompt = (
         "You are a search-query generator for movie recommendations (Japanese). "
@@ -216,11 +284,14 @@ def qwen_generate_search_queries(question: str, n: int = NUM_SEARCH_QUERIES) -> 
             "You are a search-query generator for general informational search (Japanese). "
             "Avoid restaurant, food, travel, and local business terms."
         )
-    extra_instruction = "- Use neutral factual keywords only."
+        extra_instruction = "- Use neutral factual keywords only."
 
     user = (
         f"ユーザーの質問: {question}\n\n"
         f"出力ルール:\n- {extra_instruction}\n- 出力はJSON配列（日本語の文字列配列）で1行で返してください。\n"
+        f"出力ルール:\n- {extra_instruction}\n"
+        f"- Generate {n} different queries.\n"
+        f"- 出力はJSON配列（日本語の文字列配列）で1行で返してください。\n"
         f"- 例: [\"富士山 標高\", \"富士山 高さ 公式\"]"
     )
 
@@ -300,26 +371,62 @@ def ddgs_search_many(queries: List[str], per_query: int = DDGS_MAX_PER_QUERY) ->
     log(f"[DDGS] Found {len(out)} unique hits")
     return out
 
-def refine_queries_from_hits(hits: List[Dict], n_extra: int = 2) -> List[str]:
+def refine_queries_from_hits(
+    hits: List[Dict],
+    n_extra: int = 2,
+    *,
+    intent: str | None = None,
+) -> List[str]:
+    """
+    Generate additional search queries from top search hits.
+    - intent が local_search / weather 系の場合は refine しない
+    """
+
+    # ---- intent ガード（最重要）----
+    if intent in ("local_search", "weather", "time", "calculator"):
+        return []
+
     if not hits:
         return []
-    top_text = "\n".join([f"{i+1}. {h.get('title','')} - {h.get('body','')}" for i,h in enumerate(hits[:8])])
+
+    top_text = "\n".join(
+        [
+            f"{i+1}. {h.get('title','')} - {h.get('body','')}"
+            for i, h in enumerate(hits[:8])
+        ]
+    )
+
     prompt = (
-        "以下は検索上位のタイトルとスニペットです。これを元にさらに掘るためのキーワードクエリを"
+        "以下は検索上位のタイトルとスニペットです。"
+        "これを元にさらに掘るためのキーワードクエリを"
         f"日本語で{n_extra}個生成してください（短く）。\n\n{top_text}"
     )
+
     try:
-        resp = lmstudio_chat([{"role":"system","content":"You are a search optimizer."},{"role":"user","content":prompt}], max_tokens=120, temperature=0.0, timeout=12)
-        text = resp['choices'][0]['message']['content']
+        resp = lmstudio_chat(
+            [
+                {"role": "system", "content": "You are a search optimizer."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=120,
+            temperature=0.0,
+            timeout=12,
+        )
+
+        text = resp["choices"][0]["message"]["content"]
+
         lines = [l.strip(" -•\"'") for l in text.splitlines() if l.strip()]
-        out = []
+        out: List[str] = []
+
         for ln in lines:
-            ln2 = re.sub(r'^[0-9]+[).:\-\s]*', '', ln)
+            ln2 = re.sub(r"^[0-9]+[).:\-\s]*", "", ln)
             if ln2:
                 out.append(ln2)
             if len(out) >= n_extra:
                 break
+
         return out
+
     except Exception as e:
         log("[Qwen] refine-queries error:", e)
         return []
@@ -334,34 +441,55 @@ def fetch_html(url: str) -> str:
     try:
         r = requests.get(url, headers=headers, timeout=REQUESTS_TIMEOUT)
         if r.status_code == 200 and r.content:
+            # ★ charset を強制 UTF-8
+            r.encoding = r.apparent_encoding or "utf-8"
             return r.text
     except Exception as e:
         log("[fetch_html] error:", url, e)
     return ""
 
+
 BLACKLIST_DOMAINS = [
-    "bing.com",
-    "google.com",
     "doubleclick.net",
     "facebook.com",
     "twitter.com",
+    "x.com",
     "youtube.com",
-    "xn--",
+    "bing.com",
+    "tiktok.com",
+    "instagram.com",
 ]
+
+WHITELIST_DOMAINS = [
+    "ai.google.dev",
+    "developers.google.com",
+    "cloud.google.com",
+    "gemini.google.com",
+    "openai.com",
+    "docs.openai.com",
+]
+
+from urllib.parse import urlparse
 
 def extract_text(url: str, html: str = None) -> str:
     """
     Robust extraction:
-    -domain blacklist(fast skip) 
-    - trafilatura (if available)
-    - readability
-    - bs4 heavy-clean
-    - final minimal fallback (title + first lines)
+    - domain blacklist(fast skip) 
+    - BUT keep offical Whitelist
     """
-    if any(bad in url for bad in BLACKLIST_DOMAINS):
-        log(f"[extract_text] skipped by blacklist: {url}")
-        return ""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
     
+    # whitelist 優先
+    if not any(w in domain for w in WHITELIST_DOMAINS):
+        if any(b in domain for b in BLACKLIST_DOMAINS):
+            log(f"[extract_text] skipped by blacklist: {url}")
+            return ""
+        if "xn--" in domain and not domain.endswith(".jp"):
+            log(f"[extract_text] skipped suspicious punycode: {url}")
+            return ""
+
+
     if html is None:
         html = fetch_html(url)
 
@@ -448,73 +576,34 @@ def score_text_for_restaurant(text: str, title: str = "", url: str = "") -> floa
         score += 0.4
     return score
 
+def score_text_for_spec(text: str, title: str = "", url: str = "") -> float:
+    score = 0.0
+    t = (title + " " + text).lower()
+
+    # 公式・一次情報を強く評価
+    if any(k in url for k in ["google.com", "ai.google.dev"]):
+        score += 3.0
+
+    # spec系キーワード
+    spec_keywords = [
+        "version", "バージョン", "release", "changelog",
+        "api", "model", "仕様", "対応", "更新"
+    ]
+    score += sum(0.3 for k in spec_keywords if k in t)
+
+    # 数字・バージョン表記
+    if any(ch.isdigit() for ch in text):
+        score += 0.5
+
+    # 日付があると加点
+    if any(k in t for k in ["2024", "2025", "月", "日"]):
+        score += 0.5
+
+    return score
+
 # -----------------------
 # 5) summarization & extraction (LM with small max_tokens + fast fallback)
 # -----------------------
-# ---------- summarize_and_extract の差し替え（置き換え） ----------
-def summarize_and_extract(text: str, title: str, url: str, intent: str) -> Tuple[str, Dict]:
-    """
-    Webページ本文から短い要約を生成する
-    - intent や question には一切依存しない
-    - LM失敗時はローカル抽出的要約にフォールバック
-    """
-
-    # パラメータ
-    max_chars_to_send = 1200
-    lm_max_tokens = 160
-    lm_timeout = 30
-
-    if intent == "informational":
-        # LMを使わず、先頭数行だけ返す（高速）
-        paras = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 80]
-        short = paras[0][:600] if paras else text[:600]
-        return short, {}
-
-    # --- 抜粋生成（先頭の意味ある行だけ） ---
-    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 40]
-    excerpt = "\n\n".join(lines)[:max_chars_to_send]
-
-    if not excerpt:
-        excerpt = text[:600]
-
-    system = (
-        "You are a concise Japanese summarizer. "
-        "Summarize the article factually in 2-3 sentences."
-    )
-
-    user = f"""Title: {title}
-URL: {url}
-
-Article excerpt:
-{excerpt}
-"""
-
-    try:
-        resp = lmstudio_chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=lm_max_tokens,
-            temperature=0.0,
-            timeout=lm_timeout,
-        )
-
-        summary = resp["choices"][0]["message"]["content"].strip()
-
-        if len(summary) > 1200:
-            summary = summary[:1200] + "..."
-
-        return summary, {"title": title, "url": url}
-
-    except Exception as e:
-        log("[Qwen] summarize_and_extract fallback:", e)
-
-        # --- フォールバック：先頭段落 ---
-        paras = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 80]
-        short = paras[0][:600] if paras else text[:600]
-
-        return short, {"title": title, "url": url}
 
 
 # -----------------------
@@ -534,46 +623,130 @@ def search_chroma(query: str, n_results: int = 6) -> List[str]:
 # -----------------------
 # 7) context builder
 # -----------------------
-def build_context_and_truncate(chroma_docs: List[str], web_summaries: List[Tuple[str,str,str]], char_limit: int = CHARS_LIMIT) -> str:
-    parts = []
-    total = 0
+
+def collect_candidates(chroma_docs, scored_web, min_chars: int = 50):
+    """
+    Chroma + Web を統合して候補を作る
+    - text が min_chars 未満のものは除外
+    """
+    candidates = []
+
+    # ---- Chroma docs ----
     for d in chroma_docs:
         if not d:
             continue
-        chunk = f"Document: {d}\n"
-        if total + len(chunk) > char_limit:
-            break
-        parts.append(chunk)
-        total += len(chunk)
-    for title, summ, url in web_summaries:
-        chunk = f"Source: {title}\nURL: {url}\n{summ}\n"
-        if total + len(chunk) > char_limit:
-            remaining = char_limit - total - len(f"Source: {title}\n")
-            if remaining <= 0:
+
+        text = d.strip()
+        if len(text) < min_chars:
+            continue
+
+        candidates.append({
+            "source": "chroma",
+            "text": text,
+            "meta": {}
+        })
+
+    # ---- Web docs ----
+    for item in scored_web:
+        text = (item.get("text") or "").strip()
+        if len(text) < min_chars:
+            continue
+
+        candidates.append({
+            "source": "web",
+            "text": text,
+            "meta": {
+                "title": item.get("title"),
+                "url": item.get("url")
+            }
+        })
+
+    return candidates
+
+    
+def rerank_candidates(question, candidates, top_k=8):
+    q_emb = embed_model.encode([question])[0]
+    ranked = []
+
+    for c in candidates:
+        if "emb" not in c:
+            c["emb"] = embed_model.encode([c["text"][:800]])[0]
+            
+        emb = c["emb"]
+        score = float(
+            np.dot(q_emb, emb) /
+            (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-8)
+        )
+        ranked.append((score, c))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in ranked[:top_k]]
+    
+def dedupe_by_similarity(candidates, threshold=0.92):
+    """
+    embedding 類似度が高すぎる文書を除外する
+    - rerank_candidates 後の candidates を想定
+    - c["emb"] が既に存在する前提
+    """
+    deduped = []
+
+    for c in candidates:
+        keep = True
+        for o in deduped:
+            sim = float(
+                np.dot(c["emb"], o["emb"]) /
+                (np.linalg.norm(c["emb"]) * np.linalg.norm(o["emb"]) + 1e-8)
+            )
+            if sim >= threshold:
+                keep = False
                 break
-            parts.append(f"Source: {title}\n{summ[:remaining]}...\n")
-            total = char_limit
+
+        if keep:
+            deduped.append(c)
+
+    return deduped
+
+
+    
+def build_context_from_candidates(candidates, char_limit=CHARS_LIMIT):
+    buf = []
+    total = 0
+
+    for c in candidates:
+        if c["source"] == "web":
+            header = f"[Web]\nTitle: {c['meta'].get('title')}\nURL: {c['meta'].get('url')}\n"
+        else:
+            header = "[Document]\n"
+
+        body = c["text"].strip()
+        chunk = header + body + "\n\n"
+
+        if total + len(chunk) > char_limit:
             break
-        parts.append(chunk)
+
+        buf.append(chunk)
         total += len(chunk)
-    return "\n".join(parts)
+
+    return "".join(buf)
 
 # -----------------------
 # 8) final answer pipeline
 # -----------------------
-# ---------- final_answer_pipeline の LM 呼び出しタイムアウト調整（置き換え） ----------
+# ---------- final_answer_pipeline の LM 呼び出しタイムアウト調整（置き換え） ---------
+
 def final_answer_pipeline(question: str, context: str) -> str:
     """
-    Final answer generation for RAG.
-    - Use ONLY the provided context
-    - For factual / informational questions, do not speculate
-    - If context is insufficient, explicitly say so
+    Final answer generation for RAG (non-silent version)
+    - Extract answers explicitly stated in context
+    - If partially answerable, answer only that part
+    - If nothing relevant exists, say so
     """
 
     system = (
-        "You are a factual QA assistant. "
-        "Answer strictly based on the provided context in Japanese. "
-        "If the answer cannot be determined from the context, reply exactly: INSUFFICIENT_CONTEXT"
+        "You are a careful factual QA assistant.\n"
+        "Answer in Japanese using ONLY the provided context.\n"
+        "If the context contains partial information, answer only that part.\n"
+        "If the context contains no relevant information at all, reply exactly: NO_RELEVANT_CONTEXT"
     )
 
     user = f"""Context:
@@ -585,7 +758,8 @@ Question:
 Rules:
 - Use only the context above
 - Do NOT add assumptions or external knowledge
-- If the answer is not clearly stated, reply INSUFFICIENT_CONTEXT
+- If only part of the question is answered in the context, answer only that part
+- If nothing relevant exists, reply NO_RELEVANT_CONTEXT
 """
 
     try:
@@ -594,21 +768,97 @@ Rules:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_tokens=256,
+            max_tokens=180,
             temperature=0.0,
             timeout=LM_TIMEOUT,
         )
 
         text = resp["choices"][0]["message"]["content"].strip()
 
-        if text == "INSUFFICIENT_CONTEXT":
-            return "該当する情報が文脈内に見つかりませんでした。"
+        if text == "NO_RELEVANT_CONTEXT":
+            return "関連する情報は文脈内に見つかりませんでした。"
 
         return text
 
     except Exception as e:
         log("[Qwen] final_answer_pipeline error:", e)
         return "回答生成中にエラーが発生しました。"
+
+
+def build_recommendation_answer(web_summaries):
+    """
+    recommendation 用（LMあり）
+    - タイトルと要約を統合して回答生成
+    - 重複を避けるためにタイトルを含む場合は要約のみを含める
+    """
+    context = "\n".join(
+        f"- {title}: {summary}"
+        for title, summary, _ in web_summaries[:3]
+    )
+
+    prompt = f"""
+以下の情報を元に、質問に簡潔かつ正確に答えてください。
+
+【質問】
+{question}
+
+【参考情報】
+{context}
+
+・推測はしない
+・不明な場合は「公式に明示されていない」と書く
+・最新情報があれば日付を明記する
+"""
+
+    resp = lmstudio_chat(
+        [
+            {"role": "system", "content": "You are a precise technical assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=512,
+        temperature=0.0,
+    )
+
+    return resp["choices"][0]["message"]["content"].strip()
+
+
+
+
+# =========================
+# Question analysis helpers
+# =========================
+def decide_answer_mode(intent: str, context: str, web_list) -> AnswerMode:
+    # context が完全に空 → 何も答えられない
+    if not context or len(context.strip()) < 100:
+        return AnswerMode.NO_CONTEXT
+
+    # informational は FAST_FACT 固定
+    if intent == "informational":
+        return AnswerMode.FAST_FACT
+
+    # それ以外は context QA（spec / factual / news / local）
+    return AnswerMode.CONTEXT_QA
+
+
+def extract_keywords_ja(question: str) -> list[str]:
+    q = question.replace("？", "").replace("?", "")
+    stop = {"は", "と", "の", "が", "を", "に", "です", "何"}
+
+    keywords = []
+
+    # 意味系ワードを優先
+    for w in ["違い", "比較", "意味", "理由", "特徴", "方法", "種類"]:
+        if w in q:
+            keywords.append(w)
+
+    # 名詞っぽい文字も拾う（超簡易）
+    for ch in q:
+        if ch not in stop and ch not in keywords:
+            keywords.append(ch)
+
+    return keywords
+
+
 
 # =========================
 # Answer builders
@@ -619,7 +869,7 @@ def build_informational_answer(web_summaries, question):
     informational 用（LMなし）
     - タイトルが質問語と無関係なものを除外
     """
-    keywords = set(question.replace("？", "").replace("?", "").split())
+    keywords = extract_keywords_ja(question)
     lines = []
 
     for title, summary, url in web_summaries:
@@ -643,65 +893,117 @@ def build_informational_answer(web_summaries, question):
 
     return "\n".join(lines)
 
+def build_spec_answer(web_summaries, question):
+    """
+    spec / factual 用（LMあり）
+    ・複数ソースを統合
+    ・バージョン / 型番 / 日付を明示
+    """
+    context = "\n".join(
+        f"- {title}: {summary}"
+        for title, summary, _ in web_summaries[:3]
+    )
 
+    prompt = f"""
+以下の情報を元に、質問に簡潔かつ正確に答えてください。
 
+【質問】
+{question}
 
-def build_recommendation_answer(web_summaries):
-    ...
+【参考情報】
+{context}
+
+・推測はしない
+・不明な場合は「公式に明示されていない」と書く
+・最新情報があれば日付を明記する
+"""
+
+    resp = lmstudio_chat(
+        [
+            {"role": "system", "content": "You are a precise technical assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=512,
+        temperature=0.0,
+    )
+
+    return resp["choices"][0]["message"]["content"].strip()
+
 
 # -----------------------
 # Main flow
 # -----------------------
 def main():
     question = input("質問を入力してください: ").strip()
+    if len(sys.argv) > 1:
+        question = " ".join(sys.argv[1:]).strip()
+        print(f"質問(CLI): {question}")
+    else:
+        question = input("質問を入力してください: ").strip()
     if not question:
         print("質問が空です。")
         return
 
+    # ===== FAST PATH =====
+    fast = try_fast_path(question)
+    if fast is not None:
+        print("\n=== 最終回答 ===")
+        print(fast)
+        return
     start_time = time.time()
-    log("=== STEP 1: Chroma 検索（拡張） ===")
+
+    # =====================
+    # STEP 0: intent（1回だけ）
+    # =====================
+    intent = detect_search_intent(question)
+    log(f"[Intent] {intent}")
+
+    # =====================
+    # STEP 1: Chroma
+    # =====================
+    log("=== STEP 1: Chroma 検索 ===")
     chroma_docs = search_chroma(question, n_results=6)
-    for i,d in enumerate(chroma_docs,1):
+    for i, d in enumerate(chroma_docs, 1):
         log(f"[Chroma #{i}] {str(d)[:200].replace(chr(10),' ')}")
 
-    log("=== STEP 2: Qwen による強化検索クエリ生成 ===")
-    queries = qwen_generate_search_queries(question, n=NUM_SEARCH_QUERIES)
+    # =====================
+    # STEP 2: Search queries
+    # =====================
+    log("=== STEP 2: 検索クエリ生成 ===")
+    queries = qwen_generate_search_queries(question, intent,n=NUM_SEARCH_QUERIES)
     log("Generated queries:", queries)
 
-    log("=== STEP 3: Wide ddgs 検索 ===")
+    # =====================
+    # STEP 3: ddgs wide
+    # =====================
+    log("=== STEP 3: ddgs wide search ===")
     hits = ddgs_search_many(queries, per_query=DDGS_MAX_PER_QUERY)
-    intent = detect_search_intent(question)
 
-    # 🔥 informational は件数を強制制限（超高速化）
+    # intent による件数制御
     if intent == "informational":
         hits = hits[:3]
-
-    # recommendation / local / news は多めに保持
-    elif intent in ("recommendation", "local_search", "news"):
+        hits = hits[:5]
+    elif intent in ("local_search", "news", "recommendation"):
         hits = hits[:10]
 
-
-    log("=== STEP 4: Refine queries from top hits and re-search ===")
-
-    intent = detect_search_intent(question)
-
-    # --- refine queries（必要な intent のみ） ---
-    if intent not in ("local_search", "news", "recommendation"):
-        extra = []
-    else:
-        extra = refine_queries_from_hits(hits, n_extra=2)
-
+    # =====================""" 
+    # STEP 4: refine（必要な場合のみ）
+    # =====================
+    log("=== STEP 4: refine search ===")
+    if intent in ("local_search", "news", "recommendation"):
+        extra = refine_queries_from_hits(hits, n_extra=2, intent=intent)
         if extra:
             log("Refined queries:", extra)
             more_hits = ddgs_search_many(extra, per_query=6)
 
-            before_keys = {h.get("href") or (h.get("title")+h.get("body")) for h in hits}
+            seen = {h.get("href") for h in hits if h.get("href")}
             for h in more_hits:
-                key = h.get("href") or (h.get("title")+h.get("body"))
-                if key not in before_keys:
+                if h.get("href") and h["href"] not in seen:
                     hits.append(h)
 
-    # --- unique filtering ---
+    # =====================
+    # STEP 5: unique + fetch + score
+    # =====================
     unique_hits = []
     seen = set()
     for h in hits:
@@ -709,106 +1011,72 @@ def main():
         if not key or key in seen:
             continue
         seen.add(key)
-        href = h.get("href","")
-        if href.startswith(("https://www.bing.com/aclick", "https://www.google.com/url")):
-            continue
         unique_hits.append(h)
 
     log(f"[Total unique hits] {len(unique_hits)}")
 
-    # --- fetch & score ---
     scored = []
     for h in unique_hits:
         url = h.get("href","")
         title = h.get("title","")
         text = extract_text(url)
 
+        # スクレイピング失敗時のフォールバック: 検索スニペットを利用
+        if not text or len(text) < 50:
+            snippet = h.get("body", "")
+            if snippet and len(snippet) > 30:
+                text = f"{snippet}\n(Note: Full content fetch failed, using search snippet.)"
+
         if not text:
             continue
+        
+        if intent in ("spec", "factual", "informational"):
+            score = score_text_for_spec(text, title=title, url=url)
+        else:
+            score = score_text_for_restaurant(text, title=title, url=url)
 
-        score = score_text_for_restaurant(text, title=title, url=url)
-        scored.append({"title": title, "url": url, "text": text, "score": score})
+        scored.append({
+            "title": title,
+            "url": url,
+            "text": text,
+            "score": score
+        })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     log(f"[Web] scored items: {len(scored)}")
 
-    # --- summarize / extract ---
-    web_summaries = []
 
-    if intent == "informational":
-        # 🧠 LMなし・爆速
-        for item in scored[:2]:
-            web_summaries.append(
-                (
-                    item["title"],
-                    item["text"][:600],
-                    item["url"]
-                )
-            )
+    # =====================
+    # STEP 6: summarize
+    # =====================
+    candidates = collect_candidates(chroma_docs, scored)
+    ranked_candidates = rerank_candidates(question, candidates)
+    ranked_candidates = dedupe_by_similarity(ranked_candidates)
 
-    else:
-        top_for_summary = scored[:WEB_DOCS_TO_SUMMARIZE]
+    # =====================
+    # STEP 7: context build（唯一）
+    # =====================
+    log("=== STEP 7: context build ===")
 
-        for item in tqdm(top_for_summary, desc="summarize"):
-            summary, meta = summarize_and_extract(
-                item["text"],
-                item["title"] or item["url"],
-                item["url"],
-                intent
-            )
-            web_summaries.append((item["title"], summary, item["url"]))
+    context = build_context_from_candidates(ranked_candidates)
+    context = context[:3500]
 
+    log(f"[Context chars] {len(context)}")
 
-    # embedding re-rank of summaries
-    log("=== STEP 5: Re-rank by embedding similarity ===")
-    q_emb = embed_model.encode([question])[0]
-    re_ranked = []
-    for title, summary, url in web_summaries:
-        emb = embed_model.encode([summary])[0] if summary else np.zeros(384)
-        denom = (np.linalg.norm(q_emb) * (np.linalg.norm(emb) + 1e-9))
-        cosine = float(np.dot(q_emb, emb) / denom) if denom > 0 else 0.0
-        # final combined score uses length heuristic (avoid tiny summaries)
-        length_boost = min(1.0, max(0.0, len(summary) / 500.0))
-        combined = cosine * 2.5 + length_boost
-        re_ranked.append((combined, title, summary, url, cosine))
-    re_ranked.sort(key=lambda x: x[0], reverse=True)
-    final_web_list = [(t,s,u) for (_,t,s,u,_) in re_ranked]
+    log("[Final Context Preview]")
+    log("-----")
+    log(context[:500])
+    log("-----")
 
-    log("=== STEP 6: Build context and truncate ===")
-    context = build_context_and_truncate(chroma_docs, final_web_list, char_limit=CHARS_LIMIT)
-    log(f"[Context chars] {len(context)} / limit {CHARS_LIMIT}")
-
-    log("=== STEP 7: Final Qwen pipeline (3-step) ===")
-    intent = detect_search_intent(question)
-
-    if intent == "informational":
-        # LMを使わず、要約を結合して返す
-        answer = build_informational_answer(web_summaries, question)
-    elif intent == "recommendation":
-        answer = build_recommendation_answer(web_summaries)
-    else:
-        answer = final_answer_pipeline(question, context)
-
-
-
-    # outputs
-    print("\n=== Chroma (抜粋) ===")
-    for d in chroma_docs:
-        print("-", str(d)[:400].replace("\n"," "))
-
-    print("\n=== Web summaries (抜粋) ===")
-    for idx, item in enumerate(re_ranked, 1):
-        if not isinstance(item, (list, tuple)) or len(item) < 5:
-            print(f"{idx}. Unexpected item: {item}")
-            continue
-        combined, title, summary, url, cosine = item
-        print(f"{idx}. {title} ({url}) combined={combined:.3f} cosine={cosine:.3f}")
-        print("   ", (summary or "")[:300].replace("\n", " "), "...")
+    # =====================
+    # STEP 8: final answer
+    # =====================
+    answer = final_answer_pipeline(question, context)
 
     print("\n=== 最終回答 ===")
     print(answer)
-
     log(f"\nTotal time: {time.time() - start_time:.1f}s")
+
 
 if __name__ == "__main__":
     main()
