@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { marked } from 'marked';
+import hljs from 'highlight.js';
+import 'highlight.js/styles/github-dark.css';
 
 function App() {
   const [messages, setMessages] = useState(() => {
@@ -8,6 +10,7 @@ function App() {
   });
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState('');
   const messagesEndRef = useRef(null);
   const abortControllerRef = useRef(null);
 
@@ -19,13 +22,57 @@ function App() {
     localStorage.setItem('chatMessages', JSON.stringify(messages));
   }, [messages]);
 
+  // メッセージが更新されるたびにシンタックスハイライトとコピーボタンを適用
+  useEffect(() => {
+    // このエフェクトはレンダリング後に毎回実行されます。
+    // dangerouslySetInnerHTML によってDOMが再生成されるため、
+    // 都度ハイライトの適用とボタンの追加が必要です。
+    document.querySelectorAll('pre').forEach(pre => {
+      const code = pre.querySelector('code');
+      if (!code) return;
+
+      // 1. ハイライトを適用
+      hljs.highlightElement(code);
+
+      // 2. コピーボタンが既にあれば追加しない
+      if (pre.querySelector('.copy-button')) return;
+
+      // 3. ボタンを追加
+      pre.style.position = 'relative';
+
+      const button = document.createElement('button');
+      const copyIcon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>`;
+      const checkIcon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4 text-green-400"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>`;
+
+      button.innerHTML = copyIcon;
+      button.className = 'copy-button absolute top-2 right-2 p-1 rounded-md bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-colors opacity-20 hover:opacity-100 focus:opacity-100';
+      button.title = 'Copy code';
+
+      button.addEventListener('click', (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(code.innerText).then(() => {
+          button.innerHTML = checkIcon;
+          button.title = 'Copied!';
+          setTimeout(() => {
+            button.innerHTML = copyIcon;
+            button.title = 'Copy code';
+          }, 2000);
+        });
+      });
+
+      pre.appendChild(button);
+    });
+  }, [messages]);
+
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
 
-    const userMessage = { sender: 'user', text: input };
+    const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const userMessage = { sender: 'user', text: input, timestamp };
     setMessages(prev => [...prev, userMessage]);
     setInput('');
     setIsLoading(true);
+    setLoadingStatus('考え中...');
     abortControllerRef.current = new AbortController();
 
     try {
@@ -41,7 +88,7 @@ function App() {
       }
 
       // ボットの空メッセージを追加
-      setMessages(prev => [...prev, { sender: 'bot', text: '', sources: [] }]);
+      setMessages(prev => [...prev, { sender: 'bot', text: '', sources: [], timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -66,6 +113,8 @@ function App() {
                 newMessages[lastIndex] = { ...newMessages[lastIndex], text: newMessages[lastIndex].text + data.content };
               } else if (data.type === 'sources') {
                 newMessages[lastIndex] = { ...newMessages[lastIndex], sources: data.content };
+              } else if (data.type === 'status') {
+                setLoadingStatus(data.content);
               }
               return newMessages;
             });
@@ -117,7 +166,9 @@ function App() {
               <p className="text-lg">何か質問してください</p>
             </div>
           )}
-        {messages.map((msg, index) => (
+        {messages.map((msg, index) => {
+            if (msg.sender === 'bot' && !msg.text && (!msg.sources || msg.sources.length === 0)) return null;
+            return (
             <div key={index} className={`flex items-start gap-3 ${msg.sender === 'user' ? 'flex-row-reverse' : ''}`}>
               <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 shadow-sm ${msg.sender === 'user' ? 'bg-slate-700 text-white' : 'bg-blue-600 text-white'}`}>
                 {msg.sender === 'user' ? 'U' : 'AI'}
@@ -138,16 +189,23 @@ function App() {
                 </ul>
               </div>
             )}
+            <div className={`text-xs mt-2 opacity-70 ${msg.sender === 'user' ? 'text-blue-100' : 'text-slate-400'}`}>
+              {msg.timestamp}
+            </div>
           </div>
         </div>
-        ))}
+        );
+        })}
         {isLoading && (
             <div className="flex items-start gap-3">
                <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 shadow-sm">AI</div>
-               <div className="bg-white p-4 rounded-2xl rounded-tl-none border border-slate-200 shadow-sm flex items-center gap-2 text-slate-500">
-                  <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                  <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                  <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+               <div className="bg-gradient-to-r from-blue-50 to-indigo-50 p-4 rounded-2xl rounded-tl-none border border-blue-100 shadow-md flex items-center gap-3 text-blue-700">
+                  <div className="flex gap-1.5">
+                    <div className="w-3 h-3 bg-blue-600 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                    <div className="w-3 h-3 bg-indigo-600 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                    <div className="w-3 h-3 bg-purple-600 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                  </div>
+                  <span className="text-sm font-medium animate-pulse">{loadingStatus}</span>
                </div>
           </div>
         )}
@@ -156,13 +214,22 @@ function App() {
 
         <div className="p-4 bg-white border-t border-slate-200">
           <div className="flex gap-2 max-w-4xl mx-auto relative">
-        <input
-          type="text"
+        <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && handleSend()}
-          placeholder="質問を入力してください..."
-            className="flex-grow p-4 pr-14 bg-slate-100 border-transparent rounded-full focus:bg-white focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all outline-none shadow-inner text-slate-800 placeholder-slate-400"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              handleSend();
+            }
+          }}
+          onInput={(e) => {
+            e.target.style.height = 'auto';
+            e.target.style.height = `${Math.min(e.target.scrollHeight, 150)}px`;
+          }}
+          placeholder="質問を入力してください... (Shift+Enterで改行)"
+            className="flex-grow p-4 pr-14 bg-slate-100 border-transparent rounded-2xl focus:bg-white focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all outline-none shadow-inner text-slate-800 placeholder-slate-400 resize-none overflow-hidden min-h-[56px]"
+            rows={1}
             disabled={isLoading}
             autoFocus
         />

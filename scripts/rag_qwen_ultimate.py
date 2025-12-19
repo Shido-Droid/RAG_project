@@ -57,7 +57,7 @@ LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://10.23.130.252:1234/v1/chat
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen2.5-7b-instruct")
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 CHROMA_PATH = "./chroma_db"
-TOKENS_LIMIT = 6000
+TOKENS_LIMIT = 3000
 CHARS_LIMIT = TOKENS_LIMIT * 4
 DDGS_MAX_PER_QUERY = 8
 DDGS_USE_NEWS = True
@@ -742,45 +742,37 @@ def final_answer_pipeline(question: str, context: str) -> str:
     """
 
     system = (
-        "You are a careful factual QA assistant.\n"
-        "Answer in Japanese using ONLY the provided context.\n"
-        "If the context contains partial information, answer only that part.\n"
-        "If the context contains no relevant information at all, reply exactly: NO_RELEVANT_CONTEXT"
+        "あなたは与えられた情報のみに基づいて回答するアシスタントです。\n"
+        "以下の【検索された文脈】に含まれている情報だけを使って、質問に答えてください。\n"
+        "もし文脈の中に答えがない場合は、正直に「提供された情報からは分かりません」と答えてください。\n"
+        "決して自分の知識を使って回答を捏造したり、文脈にない情報を追加したりしないでください。"
     )
 
-    user = f"""Context:
-{context}
-
-Question:
-{question}
-
-Rules:
-- Use only the context above
-- Do NOT add assumptions or external knowledge
-- If only part of the question is answered in the context, answer only that part
-- If nothing relevant exists, reply NO_RELEVANT_CONTEXT
-"""
-
-    try:
-        resp = lmstudio_chat(
+    def _try_generate(ctx):
+        user = f"【検索された文脈】:\n{ctx}\n\n【質問】:\n{question}\n"
+        return lmstudio_chat(
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_tokens=180,
+            max_tokens=512,
             temperature=0.0,
             timeout=LM_TIMEOUT,
         )
 
-        text = resp["choices"][0]["message"]["content"].strip()
-
-        if text == "NO_RELEVANT_CONTEXT":
-            return "関連する情報は文脈内に見つかりませんでした。"
-
-        return text
+    try:
+        resp = _try_generate(context)
+        return resp["choices"][0]["message"]["content"].strip()
 
     except Exception as e:
         log("[Qwen] final_answer_pipeline error:", e)
+        if "400" in str(e):
+            log("[Qwen] 400 Error detected. Retrying with shorter context...")
+            try:
+                resp = _try_generate(context[:len(context)//2])
+                return resp["choices"][0]["message"]["content"].strip()
+            except Exception as e2:
+                log("[Qwen] Retry failed:", e2)
         return "回答生成中にエラーが発生しました。"
 
 
@@ -932,22 +924,11 @@ def build_spec_answer(web_summaries, question):
 # -----------------------
 # Main flow
 # -----------------------
-def main():
-    if len(sys.argv) > 1:
-        question = " ".join(sys.argv[1:]).strip()
-        print(f"質問(CLI): {question}")
-    else:
-        question = input("質問を入力してください: ").strip()
-    if not question:
-        print("質問が空です。")
-        return
-
+def process_question(question: str) -> dict:
     # ===== FAST PATH =====
     fast = try_fast_path(question)
     if fast is not None:
-        print("\n=== 最終回答 ===")
-        print(fast)
-        return
+        return {"answer": fast, "sources": []}
     start_time = time.time()
 
     # =====================
@@ -960,7 +941,7 @@ def main():
     # STEP 1: Chroma
     # =====================
     log("=== STEP 1: Chroma 検索 ===")
-    chroma_docs = search_chroma(question, n_results=6)
+    chroma_docs = search_chroma(question, n_results=10)
     for i, d in enumerate(chroma_docs, 1):
         log(f"[Chroma #{i}] {str(d)[:200].replace(chr(10),' ')}")
 
@@ -1047,8 +1028,19 @@ def main():
     # STEP 6: summarize
     # =====================
     candidates = collect_candidates(chroma_docs, scored)
-    ranked_candidates = rerank_candidates(question, candidates)
+    ranked_candidates = rerank_candidates(question, candidates, top_k=20)
     ranked_candidates = dedupe_by_similarity(ranked_candidates)
+
+    # 参照元の抽出 (Webソースのみ)
+    sources = []
+    seen_urls = set()
+    for c in ranked_candidates:
+        if c["source"] == "web":
+            url = c["meta"].get("url")
+            title = c["meta"].get("title")
+            if url and url not in seen_urls:
+                sources.append({"title": title, "url": url})
+                seen_urls.add(url)
 
     # =====================
     # STEP 7: context build（唯一）
@@ -1056,7 +1048,6 @@ def main():
     log("=== STEP 7: context build ===")
 
     context = build_context_from_candidates(ranked_candidates)
-    context = context[:3500]
 
     log(f"[Context chars] {len(context)}")
 
@@ -1070,9 +1061,26 @@ def main():
     # =====================
     answer = final_answer_pipeline(question, context)
 
-    print("\n=== 最終回答 ===")
-    print(answer)
     log(f"\nTotal time: {time.time() - start_time:.1f}s")
+    return {"answer": answer, "sources": sources}
+
+def main():
+    if len(sys.argv) > 1:
+        question = " ".join(sys.argv[1:]).strip()
+        print(f"質問(CLI): {question}")
+    else:
+        question = input("質問を入力してください: ").strip()
+    if not question:
+        print("質問が空です。")
+        return
+
+    result = process_question(question)
+    print("\n=== 最終回答 ===")
+    print(result["answer"])
+    if result["sources"]:
+        print("\n[参照元]")
+        for s in result["sources"]:
+            print(f"- {s['title']}: {s['url']}")
 
 
 if __name__ == "__main__":
