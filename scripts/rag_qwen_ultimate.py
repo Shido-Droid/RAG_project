@@ -269,7 +269,6 @@ def qwen_generate_search_queries(question: str, intent: str, n: int = NUM_SEARCH
         "If the query is an acronym or ambiguous, add context (e.g. 'AI', 'IT', '意味') or expand it. "
         "DO NOT add restaurant, food, travel, or local business related terms unless explicitly asked."
         )
-        extra_instruction = "- Use factual terms only (definitions, numbers, official data)."
         extra_instruction = "- Use factual terms. Expand acronyms if ambiguous."
     elif intent == "recommendation":
         sys_prompt = (
@@ -934,7 +933,6 @@ def build_spec_answer(web_summaries, question):
 # Main flow
 # -----------------------
 def main():
-    question = input("質問を入力してください: ").strip()
     if len(sys.argv) > 1:
         question = " ".join(sys.argv[1:]).strip()
         print(f"質問(CLI): {question}")
@@ -981,7 +979,6 @@ def main():
 
     # intent による件数制御
     if intent == "informational":
-        hits = hits[:3]
         hits = hits[:5]
     elif intent in ("local_search", "news", "recommendation"):
         hits = hits[:10]
@@ -1029,7 +1026,7 @@ def main():
 
         if not text:
             continue
-        
+
         if intent in ("spec", "factual", "informational"):
             score = score_text_for_spec(text, title=title, url=url)
         else:
