@@ -1,0 +1,26 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # ホストのscriptsフォルダをマウント（コード変更を即反映）
+      - ./scripts:/app/scripts
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  frontend:
+    build:
+      context: ./my-rag-app
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      # ホストのソースコードをマウント
+      - ./my-rag-app:/app
+      # コンテナ内のnode_modulesを優先（ホストにnode_modulesがなくても動くようにする）
+      - /app/node_modules
+    depends_on:
+      - backend

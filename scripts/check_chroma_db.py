@@ -3,12 +3,13 @@ import os
 import sys
 
 def main():
-    # プロジェクトルートからのパスを想定
-    db_path = "./chroma_db"
+    # スクリプトの位置からプロジェクトルートを特定してパスを設定
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    db_path = os.path.join(base_dir, "chroma_db")
     
     if not os.path.exists(db_path):
         print(f"エラー: '{db_path}' が見つかりません。")
-        print("プロジェクトのルートディレクトリ (RAG_project) で実行してください。")
+        print("DBディレクトリが存在しないようです。一度アプリを起動してデータを登録してください。")
         return
 
     print(f"Connecting to ChromaDB at {db_path}...")
