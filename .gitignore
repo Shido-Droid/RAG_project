@@ -1,15 +1,11 @@
-# Python-generated files
+.venv/
 __pycache__/
-*.py[oc]
-build/
+*.pyc
+.DS_Store
+node_modules/
+chroma_db/
+chat_history.db
 dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-venv/
-ragenv/
-
-# VSCode settings
-.vscode/
+build/
+.env
+node_modules

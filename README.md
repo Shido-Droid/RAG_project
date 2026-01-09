@@ -65,7 +65,7 @@ cd RAG_project
 # 上記の手順で仮想環境を有効化
 # (例: source .venv/bin/activate)
 
-uvicorn app:app --reload
+uvicorn scripts.rag_server:app --reload --port 8000
 ```
 
 #### ターミナル2: フロントエンド (画面)

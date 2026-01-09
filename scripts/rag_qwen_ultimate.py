@@ -16,7 +16,7 @@ import json
 import re
 import requests
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any, Optional
 from sentence_transformers import SentenceTransformer
 import chromadb
 from tqdm import tqdm
@@ -41,6 +41,7 @@ try:
     from readability import Document as ReadabilityDocument
     _HAS_READABILITY = True
 except Exception:
+    ReadabilityDocument = None
     _HAS_READABILITY = False
 
 # -----------------------
@@ -55,10 +56,10 @@ class AnswerMode(Enum):
 
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://10.23.130.252:1234/v1/chat/completions")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen2.5-7b-instruct")
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
 CHROMA_PATH = "./chroma_db"
-TOKENS_LIMIT = 3000
-CHARS_LIMIT = TOKENS_LIMIT * 4
+TOKENS_LIMIT = 2000
+CHARS_LIMIT = TOKENS_LIMIT * 3
 DDGS_MAX_PER_QUERY = 8
 DDGS_USE_NEWS = True
 NUM_SEARCH_QUERIES = 4           # reduced
@@ -90,7 +91,7 @@ USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Ge
 # -----------------------
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 client = chromadb.PersistentClient(path=CHROMA_PATH)
-collection = client.get_or_create_collection("rag_docs")
+collection = client.get_or_create_collection("rag_docs_e5")
 
 # -----------------------
 # Utils
@@ -205,7 +206,7 @@ def lmstudio_chat(
 # -----------------------
 # 0) Intent detection helper
 # -----------------------
-def detect_search_intent(question: str) -> str:
+def detect_search_intent(question: str, history: List[Dict] = []) -> str:
     """
     Ask Qwen to classify intent: informational / local_search / news / other
     If LM fails, fallback simple heuristic:
@@ -214,11 +215,23 @@ def detect_search_intent(question: str) -> str:
       - contains 'ニュース', '最新', '発表' -> news
       - else informational
     """
+    # 1. Fast heuristics (Prioritize document/local keywords)
+    qlow = question.lower()
+    doc_tokens = ["このドキュメント", "この文書", "アップロード", "ファイル", "資料", "pdf", "要約", "抽出", "セクション", "章"]
+    for tok in doc_tokens:
+        if tok in qlow:
+            log(f"[Intent] Heuristic match: '{tok}' -> document_qa")
+            return "document_qa"
+
     system = (
-    "Classify intent: informational / spec / factual / local_search / news / other"
+    "Classify intent: informational / spec / factual / local_search / news / weather / document_qa / other"
     )
 
-    user = f"ユーザーの質問（日本語）: {question}\n\nReturn one of: informational, local_search, news, other"
+    history_text = ""
+    if history:
+        history_text = "会話履歴:\n" + "\n".join([f"- {h['role']}: {h['content']}" for h in history]) + "\n\n"
+
+    user = f"{history_text}ユーザーの質問（日本語）: {question}\n\nReturn one of: informational, local_search, news, weather, document_qa, other"
     try:
         resp = lmstudio_chat(
             [{"role":"system","content":system},
@@ -229,18 +242,20 @@ def detect_search_intent(question: str) -> str:
         )
 
         text = resp['choices'][0]['message']['content'].strip().lower()
-        for t in ["informational","local_search","news","other"]:
+        for t in ["informational","local_search","news","weather","document_qa","other"]:
             if t in text:
                 return t
     except Exception as e:
         log("[Intent] LM failed:", e)
     # fallback heuristics
-    qlow = question.lower()
     local_tokens = ["近く", "ランチ", "店", "レストラン", "営業時間", "おいしい", "予約"]
     news_tokens = ["ニュース", "発表", "速報", "昨日", "今日"]
     info_tokens = ["なぜ", "どうやって", "いつ", "とは", "教えて", "標高", "定義", "意味"]
     spec_tokens = ["バージョン", "仕様", "対応", "api", "model", "release"]
+    weather_tokens = ["天気", "予報", "気温", "雨", "晴れ", "台風", "気象"]
 
+    if any(tok in qlow for tok in weather_tokens):
+        return "weather"
     if any(tok in qlow for tok in local_tokens):
         return "local_search"
     if any(tok in qlow for tok in news_tokens):
@@ -254,7 +269,7 @@ def detect_search_intent(question: str) -> str:
 # -----------------------
 # 1) Query generation (intent-aware)
 # -----------------------
-def qwen_generate_search_queries(question: str, intent: str, n: int = NUM_SEARCH_QUERIES) -> List[str]:
+def qwen_generate_search_queries(question: str, intent: str, history: List[Dict] = [], n: int = NUM_SEARCH_QUERIES) -> List[str]:
     log("[Search Intent]", intent)
     # build a system prompt tailored by intent
     if intent == "local_search":
@@ -263,6 +278,9 @@ def qwen_generate_search_queries(question: str, intent: str, n: int = NUM_SEARCH
     elif intent == "news":
         sys_prompt = ("You are a search-query generator for news-related searches (Japanese). Produce concise queries that would match news articles and official sources.")
         extra_instruction = "- Prefer terms like 'ニュース', '速報', '発表', '原因', '影響'."
+    elif intent == "weather":
+        sys_prompt = ("You are a search-query generator for weather forecasts (Japanese). Produce queries to get accurate weather info.")
+        extra_instruction = "- Prefer terms like '天気', '1時間ごと', '週間予報', '気象庁'."
     elif intent == "informational":
         sys_prompt = (
         "You are a search-query generator for factual informational search (Japanese). "
@@ -285,8 +303,12 @@ def qwen_generate_search_queries(question: str, intent: str, n: int = NUM_SEARCH
         )
         extra_instruction = "- Use neutral factual keywords only."
 
+    history_text = ""
+    if history:
+        history_text = "会話履歴:\n" + "\n".join([f"- {h['role']}: {h['content']}" for h in history]) + "\n\n"
+
     user = (
-        f"ユーザーの質問: {question}\n\n"
+        f"{history_text}ユーザーの質問: {question}\n\n"
         f"出力ルール:\n- {extra_instruction}\n- 出力はJSON配列（日本語の文字列配列）で1行で返してください。\n"
         f"出力ルール:\n- {extra_instruction}\n"
         f"- Generate {n} different queries.\n"
@@ -322,6 +344,8 @@ def qwen_generate_search_queries(question: str, intent: str, n: int = NUM_SEARCH
         variants = [f"{base} ランチ", f"{base} 営業時間", f"{base} 口コミ", f"{base} 食べログ"]
     elif intent == "news":
         variants = [f"{base} ニュース", f"{base} 速報", f"{base} 発表"]
+    elif intent == "weather":
+        variants = [f"{base} 天気", f"{base} 予報", f"{base} 気象庁"]
     else:
         variants = [base, base + " とは", base + " 意味", base + " データ"]
     # ensure length n
@@ -343,8 +367,12 @@ def ddgs_search_many(queries: List[str], per_query: int = DDGS_MAX_PER_QUERY) ->
     if DDGS is None:
         log("[DDGS] ddgs/duckduckgo not available.")
         return results
-    with DDGS() as ddgs:
-        for q in queries:
+
+    try:
+        ddgs: Any = DDGS()
+        for i, q in enumerate(queries):
+            if i > 0:
+                time.sleep(1.0)  # 連続リクエストによるgzipエラー回避のため待機
             log("[DDGS] Searching:", q)
             try:
                 for r in ddgs.text(q, region="jp-jp", safesearch="off", timelimit=None, max_results=per_query):
@@ -359,6 +387,9 @@ def ddgs_search_many(queries: List[str], per_query: int = DDGS_MAX_PER_QUERY) ->
                         pass
             except Exception as e:
                 log("[DDGS] search error:", q, e)
+    except Exception as e:
+        log("[DDGS] init/search error:", e)
+
     # dedupe
     uniq = {}
     for r in results:
@@ -470,7 +501,7 @@ WHITELIST_DOMAINS = [
 
 from urllib.parse import urlparse
 
-def extract_text(url: str, html: str = None) -> str:
+def extract_text(url: str, html: Optional[str] = None) -> str:
     """
     Robust extraction:
     - domain blacklist(fast skip) 
@@ -496,6 +527,9 @@ def extract_text(url: str, html: str = None) -> str:
         log(f"[extract_text] empty HTML for {url}")
         return ""
 
+    # Sanitize HTML to prevent lxml errors with null bytes/control chars
+    html = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', html)
+
     # Trafilatura
     if trafilatura is not None:
         try:
@@ -506,7 +540,7 @@ def extract_text(url: str, html: str = None) -> str:
             pass
 
     # Readability
-    if _HAS_READABILITY:
+    if _HAS_READABILITY and ReadabilityDocument:
         try:
             doc = ReadabilityDocument(html)
             summary = doc.summary()
@@ -608,13 +642,25 @@ def score_text_for_spec(text: str, title: str = "", url: str = "") -> float:
 # -----------------------
 # 6) Chroma search
 # -----------------------
-def search_chroma(query: str, n_results: int = 6) -> List[str]:
+def search_chroma(query: str, n_results: int = 6) -> List[Dict]:
     try:
-        q_emb = embed_model.encode([query])
+        q_emb = embed_model.encode([f"query: {query}"])
         res = collection.query(query_embeddings=[q_emb[0]], n_results=n_results)
-        docs = res.get("documents", [[]])[0]
-        unique_docs = list(dict.fromkeys(docs))
-        return unique_docs[:n_results]
+        
+        documents = res.get("documents")
+        docs = documents[0] if documents else []
+        
+        metadatas = res.get("metadatas")
+        metas = metadatas[0] if metadatas else []
+        
+        # docs/metas が None の場合のガード (Chromaのバージョンによる挙動差異吸収)
+        if docs is None: docs = []
+        if metas is None: metas = []
+        
+        results = []
+        for d, m in zip(docs, metas):
+            results.append({"text": d, "meta": m or {}})
+        return results[:n_results]
     except Exception as e:
         log("[Chroma] query error:", e)
         return []
@@ -631,18 +677,19 @@ def collect_candidates(chroma_docs, scored_web, min_chars: int = 50):
     candidates = []
 
     # ---- Chroma docs ----
-    for d in chroma_docs:
-        if not d:
-            continue
-
-        text = d.strip()
+    for item in chroma_docs:
+        text = item.get("text", "").strip()
         if len(text) < min_chars:
             continue
+
+        meta = item.get("meta", {})
+        # メタデータからタイトルやソースを取得
+        title = meta.get("title") or meta.get("source") or "Local Document"
 
         candidates.append({
             "source": "chroma",
             "text": text,
-            "meta": {}
+            "meta": {"title": title, "url": meta.get("source")}
         })
 
     # ---- Web docs ----
@@ -664,16 +711,16 @@ def collect_candidates(chroma_docs, scored_web, min_chars: int = 50):
 
     
 def rerank_candidates(question, candidates, top_k=8):
-    q_emb = embed_model.encode([question])[0]
+    q_emb = embed_model.encode([f"query: {question}"])[0]
     ranked = []
 
     for c in candidates:
         if "emb" not in c:
-            c["emb"] = embed_model.encode([c["text"][:800]])[0]
+            c["emb"] = embed_model.encode([f"passage: {c['text'][:800]}"])[0]
             
         emb = c["emb"]
         score = float(
-            np.dot(q_emb, emb) /
+            np.dot(q_emb, emb) / 
             (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-8)
         )
         ranked.append((score, c))
@@ -715,7 +762,7 @@ def build_context_from_candidates(candidates, char_limit=CHARS_LIMIT):
         if c["source"] == "web":
             header = f"[Web]\nTitle: {c['meta'].get('title')}\nURL: {c['meta'].get('url')}\n"
         else:
-            header = "[Document]\n"
+            header = f"[Document: {c['meta'].get('title')}]\n"
 
         body = c["text"].strip()
         chunk = header + body + "\n\n"
@@ -733,7 +780,7 @@ def build_context_from_candidates(candidates, char_limit=CHARS_LIMIT):
 # -----------------------
 # ---------- final_answer_pipeline の LM 呼び出しタイムアウト調整（置き換え） ---------
 
-def final_answer_pipeline(question: str, context: str) -> str:
+def final_answer_pipeline(question: str, context: str, history: List[Dict] = [], intent: str = "informational", difficulty: str = "normal") -> str:
     """
     Final answer generation for RAG (non-silent version)
     - Extract answers explicitly stated in context
@@ -741,15 +788,44 @@ def final_answer_pipeline(question: str, context: str) -> str:
     - If nothing relevant exists, say so
     """
 
-    system = (
-        "あなたは与えられた情報のみに基づいて回答するアシスタントです。\n"
-        "以下の【検索された文脈】に含まれている情報だけを使って、質問に答えてください。\n"
-        "もし文脈の中に答えがない場合は、正直に「提供された情報からは分かりません」と答えてください。\n"
-        "決して自分の知識を使って回答を捏造したり、文脈にない情報を追加したりしないでください。"
-    )
+    if intent == "weather":
+        system = (
+            "あなたは天気予報のアシスタントです。\n"
+            "【検索された文脈】にある気象データ（気温、降水確率、風速など）を整理して伝えてください。\n"
+            "天候（晴れ・雨など）の明示的な記述がなくても、数値データがあればそれを回答してください。\n"
+            "文脈に日付や時刻が含まれている場合は、それも明記してください。"
+        )
+    else:
+        base_system = (
+            "あなたは与えられた情報のみに基づいて回答するアシスタントです。\n"
+            "以下の【検索された文脈】に含まれている情報だけを使って、質問に答えてください。\n"
+            "もし文脈の中に答えが全くない場合は、「提供された情報からは分かりません」とだけ答えてください。\n"
+            "回答できた場合は、「提供された情報からは分かりません」という文言を絶対に含めないでください。\n"
+            "決して自分の知識を使って回答を捏造したり、文脈にない情報を追加したりしないでください。\n"
+            "もし文脈の中に「[Section: ...]」や「[Page X]」のような情報が含まれている場合は、回答の文末に「(参照: Section '...', Page X)」のように付記してください。\n"
+            "【重要】回答に専門用語を含める場合は、必ずその用語を `[[専門用語]]` のように二重角括弧で囲ってください。例: 「このシステムは[[RAG]]に基づいています。」"
+
+        )
+        
+        if difficulty == "easy":
+            system = base_system + "\n\n【回答スタイル: 初学者向け】\n専門用語はなるべく避け、初心者にもわかりやすい言葉で、丁寧に噛み砕いて説明してください。ただし、重要な固有名詞や用語は必ず `[[ ]]` で囲ってください。"
+        elif difficulty == "professional":
+            system = base_system + "\n\n【回答スタイル: 専門的】\n専門用語を適切に使用し、簡潔かつ論理的に、実務的・専門的な観点から詳細に回答してください。重要な用語は必ず `[[ ]]` で囲ってください。"
+        else:
+            system = base_system
 
     def _try_generate(ctx):
-        user = f"【検索された文脈】:\n{ctx}\n\n【質問】:\n{question}\n"
+        history_text = ""
+        if history:
+            history_text = "Conversation History:\n" + "\n".join([f"{h['role']}: {h['content']}" for h in history]) + "\n\n"
+
+        user = (
+            f"{history_text}【検索された文脈】:\n{ctx}\n\n"
+            f"【質問】:\n{question}\n\n"
+            "【指示】:\n"
+            "回答に含まれる重要な専門用語、システム名、機能名などは、必ず `[[用語]]` のように二重角括弧で囲ってください。\n"
+            "例: 「[[無限大キャンパス]]では[[履修登録]]が可能です。」"
+        )
         return lmstudio_chat(
             [
                 {"role": "system", "content": system},
@@ -762,7 +838,14 @@ def final_answer_pipeline(question: str, context: str) -> str:
 
     try:
         resp = _try_generate(context)
-        return resp["choices"][0]["message"]["content"].strip()
+        content = resp["choices"][0]["message"]["content"].strip()
+
+        # Post-processing: 回答が生成されているのに「分かりません」が含まれている場合、削除する
+        failure_phrase = "提供された情報からは分かりません"
+        if failure_phrase in content and len(content) > 50:
+            content = content.replace(failure_phrase, "")
+
+        return content.strip()
 
     except Exception as e:
         log("[Qwen] final_answer_pipeline error:", e)
@@ -776,7 +859,7 @@ def final_answer_pipeline(question: str, context: str) -> str:
         return "回答生成中にエラーが発生しました。"
 
 
-def build_recommendation_answer(web_summaries):
+def build_recommendation_answer(web_summaries, question):
     """
     recommendation 用（LMあり）
     - タイトルと要約を統合して回答生成
@@ -924,7 +1007,7 @@ def build_spec_answer(web_summaries, question):
 # -----------------------
 # Main flow
 # -----------------------
-def process_question(question: str) -> dict:
+def process_question(question: str, history: List[Dict] = [], difficulty: str = "normal") -> dict:
     # ===== FAST PATH =====
     fast = try_fast_path(question)
     if fast is not None:
@@ -934,7 +1017,7 @@ def process_question(question: str) -> dict:
     # =====================
     # STEP 0: intent（1回だけ）
     # =====================
-    intent = detect_search_intent(question)
+    intent = detect_search_intent(question, history)
     log(f"[Intent] {intent}")
 
     # =====================
@@ -943,26 +1026,31 @@ def process_question(question: str) -> dict:
     log("=== STEP 1: Chroma 検索 ===")
     chroma_docs = search_chroma(question, n_results=10)
     for i, d in enumerate(chroma_docs, 1):
-        log(f"[Chroma #{i}] {str(d)[:200].replace(chr(10),' ')}")
+        log(f"[Chroma #{i}] {str(d.get('text'))[:100].replace(chr(10),' ')}... (Meta: {d.get('meta')})")
 
     # =====================
     # STEP 2: Search queries
     # =====================
-    log("=== STEP 2: 検索クエリ生成 ===")
-    queries = qwen_generate_search_queries(question, intent,n=NUM_SEARCH_QUERIES)
-    log("Generated queries:", queries)
+    if intent == "document_qa":
+        log("=== STEP 2 & 3: Web search skipped (document_qa) ===")
+        queries = []
+        hits = []
+    else:
+        log("=== STEP 2: 検索クエリ生成 ===")
+        queries = qwen_generate_search_queries(question, intent, history, n=NUM_SEARCH_QUERIES)
+        log("Generated queries:", queries)
 
-    # =====================
-    # STEP 3: ddgs wide
-    # =====================
-    log("=== STEP 3: ddgs wide search ===")
-    hits = ddgs_search_many(queries, per_query=DDGS_MAX_PER_QUERY)
+        # =====================
+        # STEP 3: ddgs wide
+        # =====================
+        log("=== STEP 3: ddgs wide search ===")
+        hits = ddgs_search_many(queries, per_query=DDGS_MAX_PER_QUERY)
 
-    # intent による件数制御
-    if intent == "informational":
-        hits = hits[:5]
-    elif intent in ("local_search", "news", "recommendation"):
-        hits = hits[:10]
+        # intent による件数制御
+        if intent == "informational":
+            hits = hits[:5]
+        elif intent in ("local_search", "news", "recommendation", "weather"):
+            hits = hits[:10]
 
     # =====================""" 
     # STEP 4: refine（必要な場合のみ）
@@ -1008,7 +1096,7 @@ def process_question(question: str) -> dict:
         if not text:
             continue
 
-        if intent in ("spec", "factual", "informational"):
+        if intent in ("spec", "factual", "informational", "weather"):
             score = score_text_for_spec(text, title=title, url=url)
         else:
             score = score_text_for_restaurant(text, title=title, url=url)
@@ -1035,12 +1123,11 @@ def process_question(question: str) -> dict:
     sources = []
     seen_urls = set()
     for c in ranked_candidates:
-        if c["source"] == "web":
-            url = c["meta"].get("url")
-            title = c["meta"].get("title")
-            if url and url not in seen_urls:
-                sources.append({"title": title, "url": url})
-                seen_urls.add(url)
+        url = c["meta"].get("url")
+        title = c["meta"].get("title")
+        if url and url not in seen_urls:
+            sources.append({"title": title, "url": url})
+            seen_urls.add(url)
 
     # =====================
     # STEP 7: context build（唯一）
@@ -1059,10 +1146,210 @@ def process_question(question: str) -> dict:
     # =====================
     # STEP 8: final answer
     # =====================
-    answer = final_answer_pipeline(question, context)
+    answer = final_answer_pipeline(question, context, history, intent=intent, difficulty=difficulty)
 
     log(f"\nTotal time: {time.time() - start_time:.1f}s")
     return {"answer": answer, "sources": sources}
+
+def analyze_document_content(text: str) -> Dict[str, Any]:
+    """ドキュメントの内容を分析し、要約・タイトル・キーワードを抽出する"""
+    if not text:
+        return {}
+    
+    # 先頭3500文字程度を分析対象にする
+    excerpt = text[:3500]
+    
+    system = "You are a helpful assistant. Analyze the text and extract summary, title, and keywords."
+    user = (
+        f"Text:\n{excerpt}\n\n"
+        "Please output the result in the following JSON format (Japanese):\n"
+        "{\n"
+        '  "summary": "Concise summary using bullet points",\n'
+        '  "title": "A short descriptive title",\n'
+        '  "keywords": ["keyword1", "keyword2", "keyword3"]\n'
+        "}"
+    )
+    
+    try:
+        resp = lmstudio_chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            max_tokens=350,
+            temperature=0.2
+        )
+        content = resp["choices"][0]["message"]["content"].strip()
+        # JSONブロックの除去
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+            
+        return safe_json_load(content) or {}
+    except Exception as e:
+        log(f"[Analyze] Error: {e}")
+        return {}
+
+def add_document_to_kb(text: str, source: str, doc_metadata: Optional[Dict[str, Any]] = None):
+    if not text:
+        return
+
+    if doc_metadata is None:
+        doc_metadata = {}
+
+    # Simple chunking
+    chunk_size = 600
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    
+    ids = [f"{source}_part{i}_{int(time.time())}" for i in range(len(chunks))]
+    
+    # メタデータの構築
+    title = doc_metadata.get("title") or source
+    if isinstance(title, list):
+        title = " ".join([str(t) for t in title])
+    elif not isinstance(title, str):
+        title = str(title)
+
+    summary = doc_metadata.get("summary", "")
+    if isinstance(summary, list):
+        summary = "\n".join([str(s) for s in summary])
+    elif not isinstance(summary, str):
+        summary = str(summary)
+
+    keywords = doc_metadata.get("keywords", [])
+    if isinstance(keywords, list):
+        keywords_str = ", ".join(keywords)
+    else:
+        keywords_str = str(keywords)
+
+    base_meta = {
+        "source": source,
+        "title": title,
+        "summary": summary,
+        "keywords": keywords_str
+    }
+    metadatas: List[Any] = [base_meta.copy() for _ in chunks]
+    
+    # Embedding
+    embeddings = embed_model.encode([f"passage: {c}" for c in chunks])
+    
+    collection.add(
+        ids=ids,
+        documents=chunks,
+        embeddings=embeddings.tolist(),
+        metadatas=metadatas
+    )
+    log(f"[DB] Added {len(chunks)} chunks from {source}")
+
+def clear_knowledge_base():
+    try:
+        all_ids = collection.get()['ids']
+        if all_ids:
+            collection.delete(ids=all_ids)
+        log("[DB] Knowledge base cleared.")
+    except Exception as e:
+        log(f"[DB] clear_knowledge_base error: {e}")
+        raise e
+
+def get_all_documents() -> List[Dict[str, Any]]:
+    """DB内の全ドキュメントのソース一覧を取得"""
+    try:
+        # メタデータのみ取得して軽量化
+        data = collection.get(include=['metadatas'])
+        metadatas = data.get('metadatas')
+        if metadatas is None:
+            metadatas = []
+        
+        # ソース名でユニーク化
+        docs_map = {}
+        for m in metadatas:
+            if m and 'source' in m:
+                src = m['source']
+                # 既に登録済みでも、情報量が多い（summaryがある）メタデータを優先して保持する
+                if src not in docs_map or (not docs_map[src] and m.get('summary')):
+                    docs_map[src] = m
+        
+        # リスト化
+        result = []
+        for src, m in docs_map.items():
+            result.append({
+                "source": src,
+                "title": m.get("title", src),
+                "summary": m.get("summary", ""),
+                "keywords": m.get("keywords", "")
+            })
+            
+        return sorted(result, key=lambda x: x['source'])
+    except Exception as e:
+        log("[DB] get_all_documents error:", e)
+        return []
+
+def document_exists(source: str) -> bool:
+    """指定されたソースのドキュメントが存在するか確認"""
+    try:
+        # limit=1 で存在確認
+        result = collection.get(where={"source": source}, limit=1)
+        return len(result['ids']) > 0
+    except Exception as e:
+        log(f"[DB] document_exists error: {e}")
+        return False
+
+def delete_document_from_kb(source: str) -> bool:
+    """指定されたソースのドキュメントを削除"""
+    try:
+        collection.delete(where={"source": source})
+        log(f"[DB] Deleted document: {source}")
+        return True
+    except Exception as e:
+        log(f"[DB] delete_document_from_kb error: {e}")
+        return False
+
+def update_document_title(source: str, new_title: str) -> bool:
+    """指定されたソースのドキュメントのタイトルを更新"""
+    try:
+        # Get all chunks for this source
+        result = collection.get(where={"source": source})
+        ids = result['ids']
+        metadatas = result['metadatas']
+        
+        if not ids:
+            return False
+            
+        if metadatas is None:
+            metadatas = []
+
+        # Update title in all metadatas
+        new_metadatas = []
+        for meta in metadatas:
+            if meta is None:
+                m: Dict[str, Any] = {}
+            else:
+                m = dict(meta)
+            m['title'] = new_title
+            new_metadatas.append(m)
+            
+        collection.update(ids=ids, metadatas=new_metadatas)
+        log(f"[DB] Updated title for {source} to '{new_title}'")
+        return True
+    except Exception as e:
+        log(f"[DB] update_document_title error: {e}")
+        return False
+
+def explain_term(term: str) -> str:
+    """専門用語の解説を生成する"""
+    system = "You are a helpful teacher. Explain the technical term concisely for a student in Japanese."
+    user = f"Term: {term}\n\nExplanation:"
+    try:
+        resp = lmstudio_chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            max_tokens=200,
+            temperature=0.2,
+            timeout=LM_SHORT_TIMEOUT
+        )
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log(f"[Explain] Error: {e}")
+        return "解説を取得できませんでした。"
 
 def main():
     if len(sys.argv) > 1:
