@@ -97,7 +97,7 @@ uvicorn scripts.rag_server:app --reload --port 8000
 
 #### ターミナル2: フロントエンド (画面)
 ```bash
-cd RAG_project/my-rag-app
+cd my-rag-app
 npm run dev
 ```
 

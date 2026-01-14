@@ -8,6 +8,8 @@ services:
     volumes:
       # ホストのscriptsフォルダをマウント（コード変更を即反映）
       - ./scripts:/app/scripts
+      # ChromaDBのデータを永続化（再起動しても消えないようにする）
+      - ./chroma_db:/app/chroma_db
     environment:
       - PYTHONUNBUFFERED=1
 

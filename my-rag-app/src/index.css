@@ -1,2 +1,4 @@
 @import "tailwindcss";
 
+/* VS Codeでエラーが出ることがありますが、Tailwind v4の正常な構文です */
+@variant dark (&:where(.dark, .dark *));

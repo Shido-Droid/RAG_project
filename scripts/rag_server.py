@@ -185,6 +185,9 @@ async def ask_endpoint(request: QueryRequest):
 
     def generate():
         try:
+            # 【改善】処理開始のステータスを即座に通知
+            yield json.dumps({"type": "status", "content": "質問を分析し、ドキュメントを検索中..."}, ensure_ascii=False) + "\n"
+
             # 処理実行 (同期関数)
             result = process_question(request.question, history=history, difficulty=request.difficulty)
             
@@ -197,11 +200,15 @@ async def ask_endpoint(request: QueryRequest):
             except Exception as e:
                 print(f"DB Error (Bot): {e}")
 
+            # 【改善】生成完了ステータス
+            yield json.dumps({"type": "status", "content": "回答を表示します"}, ensure_ascii=False) + "\n"
+
             # App.jsx が期待する形式で分割して送信
             yield json.dumps({"type": "sources", "content": result["sources"]}, ensure_ascii=False) + "\n"
             yield json.dumps({"type": "answer", "content": result["answer"]}, ensure_ascii=False) + "\n"
+            yield json.dumps({"type": "done", "content": "completed"}, ensure_ascii=False) + "\n"
         except Exception as e:
-            yield json.dumps({"type": "answer", "content": f"Error: {str(e)}"}, ensure_ascii=False) + "\n"
+            yield json.dumps({"type": "error", "content": f"エラーが発生しました: {str(e)}"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
