@@ -9,9 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-# scripts フォルダをパスに追加してインポートできるようにする
-sys.path.append(os.path.join(os.path.dirname(__file__), "scripts"))
-from rag_qwen_ultimate import process_question
+from src.rag_app import process_question
 
 app = FastAPI()
 

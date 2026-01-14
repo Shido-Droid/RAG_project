@@ -17,9 +17,17 @@ import pytesseract
 from pdf2image import convert_from_bytes
 from PIL import Image
 
-# rag_qwen_ultimate.py をインポートできるようにパスを追加
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from rag_qwen_ultimate import process_question, add_document_to_kb, clear_knowledge_base, get_all_documents, delete_document_from_kb, document_exists, analyze_document_content, update_document_title, explain_term
+from src.rag_app import (
+    process_question, 
+    add_document_to_kb, 
+    clear_knowledge_base, 
+    get_all_documents, 
+    delete_document_from_kb, 
+    document_exists, 
+    analyze_document_content, 
+    update_document_title, 
+    explain_term
+)
 
 app = FastAPI(
     title="RAG Qwen Ultimate API",
