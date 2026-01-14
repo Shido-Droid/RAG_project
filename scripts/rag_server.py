@@ -345,4 +345,5 @@ async def upload_file_endpoint(file: UploadFile = File(...), autorename: bool = 
 
 if __name__ == "__main__":
     # 開発用サーバー起動
+    print(f"Starting RAG Server on http://0.0.0.0:8000 (Docs: http://localhost:8000/docs)")
     uvicorn.run(app, host="0.0.0.0", port=8000)

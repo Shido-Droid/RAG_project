@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import * as api from '../api/client';
 
 export const useDocuments = () => {
@@ -9,6 +9,7 @@ export const useDocuments = () => {
   const [editTitle, setEditTitle] = useState('');
   const [deletingDoc, setDeletingDoc] = useState(null);
   const [useOcr, setUseOcr] = useState(false);
+  const hasFetchedDocuments = useRef(false);
 
   const fetchDocuments = useCallback(async (retryCount = 0) => {
     setIsDocsLoading(true);
@@ -27,7 +28,10 @@ export const useDocuments = () => {
   }, []);
 
   useEffect(() => {
-    fetchDocuments();
+    if (!hasFetchedDocuments.current) {
+      hasFetchedDocuments.current = true;
+      fetchDocuments();
+    }
   }, [fetchDocuments]);
 
   const uploadFile = async (file) => {
@@ -69,6 +73,16 @@ export const useDocuments = () => {
     }
   };
 
+  const resetDb = async () => {
+    try {
+      await api.resetDb();
+      setDocuments([]);
+    } catch (e) {
+      console.error("Reset DB failed", e);
+      throw e;
+    }
+  };
+
   return {
     documents,
     isDocsLoading,
@@ -83,6 +97,7 @@ export const useDocuments = () => {
     fetchDocuments,
     uploadFile,
     deleteDocument,
-    updateTitle
+    updateTitle,
+    resetDb
   };
 };

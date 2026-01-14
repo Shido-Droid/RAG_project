@@ -1,5 +1,4 @@
 import { useState, useRef } from 'react';
-import * as api from './api/client';
 import Sidebar from './components/Sidebar';
 import ChatArea from './components/ChatArea';
 import { useChat } from './hooks/useChat';
@@ -11,13 +10,13 @@ function App() {
   const { 
     messages, addMessage, clearMessages, 
     isLoading, loadingMessage, isHistoryLoading, 
-    handleSend, handleStop 
+    handleSend, handleStop, resetSession
   } = useChat();
 
   const {
     documents, setDocuments, isDocsLoading, isUploading,
     editingDoc, setEditingDoc, editTitle, setEditTitle, deletingDoc, useOcr, setUseOcr,
-    uploadFile, deleteDocument, updateTitle
+    uploadFile, deleteDocument, updateTitle, resetDb
   } = useDocuments();
 
   const { isDarkMode, setIsDarkMode } = useTheme();
@@ -58,8 +57,7 @@ function App() {
   const handleResetDb = async () => {
     if (!confirm("本当にすべての学習データを削除しますか？")) return;
     try {
-      await api.resetDb();
-      setDocuments([]);
+      await resetDb();
       addMessage({ 
         sender: 'system', 
         text: "🗑️ データベースを初期化しました。",
@@ -103,7 +101,6 @@ function App() {
   const handleClearChat = async () => {
     if (!confirm("チャット履歴を削除しますか？")) return;
     try {
-      await api.clearHistory();
       clearMessages();
     } catch (e) {
       alert("削除に失敗しました");
@@ -114,7 +111,7 @@ function App() {
   const handleResetContext = async () => {
     try {
       // サーバー側の履歴を削除して、AIのコンテキストをクリアする
-      await api.clearHistory();
+      await resetSession();
       
       // 画面上には区切り線となるメッセージを表示
       addMessage({ 
@@ -141,7 +138,7 @@ function App() {
   };
 
   return (
-    <div className="fixed inset-0 flex h-[100dvh] w-full bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-sans overflow-hidden transition-colors duration-200">
+    <div className="fixed inset-0 flex h-[100dvh] w-full bg-gradient-to-br from-indigo-50 via-slate-50 to-blue-100 dark:from-slate-900 dark:via-slate-900 dark:to-slate-800 text-slate-800 dark:text-slate-100 font-sans overflow-hidden transition-colors duration-200">
       
       <Sidebar
         isOpen={isSidebarOpen}
@@ -189,9 +186,9 @@ function App() {
       {/* Document Details Modal */}
       {viewingDoc && (
         <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-2xl max-w-2xl w-full overflow-hidden flex flex-col max-h-[80vh] animate-in fade-in zoom-in duration-200">
-            <div className="p-4 border-b border-slate-100 dark:border-slate-700 flex justify-between items-center bg-slate-50/50 dark:bg-slate-700/50">
-              <h3 className="font-bold text-slate-700 dark:text-slate-200 flex items-center gap-2">
+          <div className="bg-white/80 dark:bg-slate-800/80 backdrop-blur-xl rounded-2xl shadow-2xl border border-white/20 dark:border-white/10 max-w-2xl w-full overflow-hidden flex flex-col max-h-[80vh] animate-in fade-in zoom-in duration-200">
+            <div className="p-4 border-b border-slate-200/30 dark:border-slate-700/30 flex justify-between items-center bg-white/30 dark:bg-white/5">
+              <h3 className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
                 <span className="text-xl">📄</span> {viewingDoc.title || viewingDoc.source}
               </h3>
               <button 
@@ -204,11 +201,11 @@ function App() {
             <div className="p-6 overflow-y-auto space-y-4">
               <div>
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">ファイル名</h4>
-                <p className="text-sm text-slate-700 dark:text-slate-300 font-mono bg-slate-50 dark:bg-slate-700 px-2 py-1 rounded border border-slate-100 dark:border-slate-600 inline-block">{viewingDoc.source}</p>
+                <p className="text-sm text-slate-700 dark:text-slate-300 font-mono bg-white/50 dark:bg-black/20 px-2 py-1 rounded border border-slate-200/50 dark:border-slate-700 inline-block">{viewingDoc.source}</p>
               </div>
               
               <div className="flex flex-col h-full min-h-[200px]">
-                <div className="flex border-b border-slate-200 dark:border-slate-700 mb-2">
+                <div className="flex border-b border-slate-200/50 dark:border-slate-700/50 mb-2">
                   <button 
                     onClick={() => setModalTab('summary')}
                     className={`px-4 py-2 text-sm font-bold transition-colors border-b-2 ${modalTab === 'summary' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'}`}
@@ -222,14 +219,14 @@ function App() {
                     本文 (OCR結果)
                   </button>
                 </div>
-                <div className="bg-slate-50 dark:bg-slate-700 p-4 rounded-lg border border-slate-100 dark:border-slate-600 flex-1 overflow-y-auto max-h-[300px]">
+                <div className="bg-white/40 dark:bg-black/20 p-4 rounded-lg border border-white/20 dark:border-white/5 flex-1 overflow-y-auto max-h-[300px]">
                   <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap font-mono">
                     {modalTab === 'summary' ? (viewingDoc.summary || "要約はありません") : (viewingDoc.content || "本文データがありません")}
                   </p>
                 </div>
               </div>
 
-              <div className="pt-4 border-t border-slate-100 dark:border-slate-700">
+              <div className="pt-4 border-t border-slate-200/30 dark:border-slate-700/30">
                 <button
                   onClick={() => {
                     handleSelectDoc(viewingDoc);

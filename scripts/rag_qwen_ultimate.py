@@ -57,7 +57,7 @@ class AnswerMode(Enum):
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://10.23.130.252:1234/v1/chat/completions")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen2.5-7b-instruct")
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
-CHROMA_PATH = "./chroma_db"
+CHROMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "chroma_db")
 TOKENS_LIMIT = 2000
 CHARS_LIMIT = TOKENS_LIMIT * 3
 DDGS_MAX_PER_QUERY = 8
@@ -798,6 +798,7 @@ def final_answer_pipeline(question: str, context: str, history: List[Dict] = [],
     else:
         base_system = (
             "あなたは与えられた情報のみに基づいて回答するアシスタントです。\n"
+            "日本語で回答してください。\n"
             "以下の【検索された文脈】に含まれている情報だけを使って、質問に答えてください。\n"
             "もし文脈の中に答えが全くない場合は、「提供された情報からは分かりません」とだけ答えてください。\n"
             "回答できた場合は、「提供された情報からは分かりません」という文言を絶対に含めないでください。\n"
@@ -1265,7 +1266,7 @@ def get_all_documents() -> List[Dict[str, Any]]:
             if m and 'source' in m:
                 src = m['source']
                 # 既に登録済みでも、情報量が多い（summaryがある）メタデータを優先して保持する
-                if src not in docs_map or (not docs_map[src] and m.get('summary')):
+                if src not in docs_map or (m.get('summary') and not docs_map[src].get('summary')):
                     docs_map[src] = m
         
         # リスト化

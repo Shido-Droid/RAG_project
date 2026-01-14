@@ -1,12 +1,32 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import * as api from '../api/client';
 
+// ストリーミングレスポンスを解析するジェネレーター関数
+async function* streamReader(reader) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (line.trim()) yield JSON.parse(line);
+    }
+  }
+}
+
 export const useChat = () => {
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
   const [isHistoryLoading, setIsHistoryLoading] = useState(true);
   const abortControllerRef = useRef(null);
+  const hasFetchedHistory = useRef(false);
 
   const fetchHistory = useCallback(async (retryCount = 0) => {
     try {
@@ -24,7 +44,10 @@ export const useChat = () => {
   }, []);
 
   useEffect(() => {
-    fetchHistory();
+    if (!hasFetchedHistory.current) {
+      hasFetchedHistory.current = true;
+      fetchHistory();
+    }
   }, [fetchHistory]);
 
   const addMessage = (message) => {
@@ -51,24 +74,11 @@ export const useChat = () => {
 
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
       let botMessageAdded = false;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; 
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          
+      try {
+        for await (const data of streamReader(response.body.getReader())) {
           try {
-            const data = JSON.parse(line);
 
             if (data.type === 'status') {
               setLoadingMessage(data.content);
@@ -101,9 +111,12 @@ export const useChat = () => {
               setIsLoading(false);
             }
           } catch (e) {
-            console.error('Failed to parse stream data:', e, 'line:', line);
+            console.error('Failed to process stream data:', e);
           }
         }
+      } catch (e) {
+        console.error('Stream reading error:', e);
+        throw e;
       }
     } catch (error) {
       if (error.name !== 'AbortError') {
@@ -118,11 +131,23 @@ export const useChat = () => {
 
   const handleStop = () => abortControllerRef.current?.abort();
 
-  const clearMessages = () => setMessages([]);
+  const resetSession = async () => {
+    await api.clearHistory();
+  };
+
+  const clearMessages = async () => {
+    try {
+      await resetSession();
+      setMessages([]);
+    } catch (error) {
+      console.error("Failed to clear history:", error);
+      // Optionally, show an error to the user
+    }
+  };
 
   return {
     messages, setMessages, addMessage, clearMessages,
     isLoading, loadingMessage, isHistoryLoading,
-    handleSend, handleStop, fetchHistory
+    handleSend, handleStop, fetchHistory, resetSession
   };
 };

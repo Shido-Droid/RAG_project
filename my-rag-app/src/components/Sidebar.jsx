@@ -33,8 +33,8 @@ export default function Sidebar({
   onResetDb
 }) {
   return (
-    <div className={`${isOpen ? 'w-80' : 'w-0'} bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl border-r border-slate-200/50 dark:border-slate-700/50 flex flex-col transition-all duration-300 ease-in-out overflow-hidden flex-shrink-0 relative shadow-2xl z-20`}>
-      <div className="p-5 border-b border-slate-200/30 dark:border-slate-700/30 flex justify-between items-center">
+    <div className={`${isOpen ? 'w-80' : 'w-0'} bg-white/30 dark:bg-slate-900/50 backdrop-blur-2xl border-r border-white/20 dark:border-white/10 flex flex-col transition-all duration-300 ease-in-out overflow-hidden flex-shrink-0 relative shadow-2xl z-20`}>
+      <div className="p-5 border-b border-white/20 dark:border-white/10 flex justify-between items-center">
         <h2 className="font-bold text-lg text-slate-700 dark:text-slate-200">📚 ソース</h2>
         <button onClick={onClose} className="md:hidden text-slate-400 hover:text-slate-600">✕</button>
       </div>
@@ -43,7 +43,7 @@ export default function Sidebar({
         {/* Upload Area */}
         <div 
           onClick={() => fileInputRef.current.click()}
-          className={`border-2 border-dashed border-slate-300/50 dark:border-slate-600/50 bg-slate-50/30 dark:bg-slate-800/30 rounded-xl p-6 text-center cursor-pointer hover:border-blue-400/70 hover:bg-blue-50/50 dark:hover:bg-slate-700/50 transition-all ${isUploading ? 'opacity-50 pointer-events-none' : ''}`}
+          className={`border-2 border-dashed border-slate-400/30 dark:border-slate-600/50 bg-white/20 dark:bg-white/5 rounded-xl p-6 text-center cursor-pointer hover:border-blue-400/70 hover:bg-blue-50/30 dark:hover:bg-blue-900/20 transition-all ${isUploading ? 'opacity-50 pointer-events-none' : ''}`}
         >
           <input 
             type="file" 
@@ -81,7 +81,7 @@ export default function Sidebar({
             <p className="text-sm text-slate-400 italic">ドキュメントはありません</p>
           ) : (
             documents.map((doc, i) => (
-              <div key={i} className="flex items-center gap-2 p-2 bg-white/40 dark:bg-slate-800/40 hover:bg-white/60 dark:hover:bg-slate-700/60 backdrop-blur-sm rounded-lg border border-white/20 dark:border-slate-600/30 text-sm group transition-all shadow-sm">
+              <div key={i} className="flex items-center gap-2 p-2 bg-white/20 dark:bg-white/5 hover:bg-white/40 dark:hover:bg-white/10 backdrop-blur-sm rounded-lg border border-white/20 dark:border-white/10 text-sm group transition-all shadow-sm">
                 <span className="text-lg">📑</span>
                 
                 {editingDoc === doc.source ? (
@@ -106,7 +106,7 @@ export default function Sidebar({
                       <div className="truncate font-medium dark:text-slate-200" title={doc.summary || "要約なし"}>{doc.title || doc.source}</div>
                       {(doc.size || doc.keywords) && (
                         <div className="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
-                          {doc.size && <span className="flex-shrink-0 font-mono text-[10px] bg-slate-100 dark:bg-slate-700 px-1.5 py-0.5 rounded opacity-80">{formatBytes(doc.size)}</span>}
+                          {doc.size && <span className="flex-shrink-0 font-mono text-[10px] bg-white/50 dark:bg-black/30 px-1.5 py-0.5 rounded opacity-80">{formatBytes(doc.size)}</span>}
                           {doc.keywords && <span className="truncate" title={doc.keywords}>{doc.keywords}</span>}
                         </div>
                       )}
@@ -134,7 +134,7 @@ export default function Sidebar({
         </div>
       </div>
 
-      <div className="p-4 border-t border-slate-200/30 dark:border-slate-700/30">
+      <div className="p-4 border-t border-white/20 dark:border-white/10">
         <button 
           onClick={onResetDb}
           className="w-full py-2 px-4 text-xs font-bold text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors flex items-center justify-center gap-2"
