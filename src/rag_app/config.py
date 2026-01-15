@@ -18,11 +18,11 @@ EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CHROMA_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
 
-TOKENS_LIMIT = 2000
+TOKENS_LIMIT = 1000
 CHARS_LIMIT = TOKENS_LIMIT * 3
-DDGS_MAX_PER_QUERY = 8
+DDGS_MAX_PER_QUERY = 4
 DDGS_USE_NEWS = True
-NUM_SEARCH_QUERIES = 4
+NUM_SEARCH_QUERIES = 2
 WEB_DOCS_TO_SUMMARIZE = 2
 VERBOSE = True
 REQUESTS_TIMEOUT = 8

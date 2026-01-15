@@ -4,12 +4,20 @@ import ChatArea from './components/ChatArea';
 import { useChat } from './hooks/useChat';
 import { useDocuments } from './hooks/useDocuments';
 import { useTheme } from './hooks/useTheme';
+import { ToastProvider, useToast } from './components/ui/ToastContext';
 
 function App() {
-  // Custom Hooks
-  const { 
-    messages, addMessage, clearMessages, 
-    isLoading, loadingMessage, isHistoryLoading, 
+  return (
+    <ToastProvider>
+      <AppContent />
+    </ToastProvider>
+  );
+}
+
+function AppContent() {
+  const {
+    messages, addMessage, clearMessages,
+    isLoading, loadingMessage, isHistoryLoading,
     handleSend, handleStop, resetSession
   } = useChat();
 
@@ -21,12 +29,15 @@ function App() {
 
   const { isDarkMode, setIsDarkMode } = useTheme();
 
+  // Toast Hooks
+  const { addToast, confirm: confirmDialog } = useToast();
+
   // UI States
   const [isSidebarOpen, setIsSidebarOpen] = useState(true); // モバイル対応用
   const [viewingDoc, setViewingDoc] = useState(null);
   const [modalTab, setModalTab] = useState('summary'); // 'summary' | 'content'
   const [pendingChatInput, setPendingChatInput] = useState('');
-  
+
   const fileInputRef = useRef(null);
 
   // --- ファイルアップロード ---
@@ -37,17 +48,19 @@ function App() {
     try {
       const data = await uploadFile(files[0]);
       // アップロード成功通知（チャット欄に表示）
-      addMessage({ 
-        sender: 'system', 
+      addMessage({
+        sender: 'system',
         text: `✅ ファイルを読み込みました: ${files[0].name} (${data.message})`,
         timestamp: new Date().toLocaleTimeString()
       });
+      addToast(`ファイルを読み込みました: ${files[0].name}`, 'success');
     } catch (error) {
-      addMessage({ 
-        sender: 'system', 
+      addMessage({
+        sender: 'system',
         text: `❌ アップロードエラー: ${error.message}`,
         timestamp: new Date().toLocaleTimeString()
       });
+      addToast(`アップロードエラー: ${error.message}`, 'error');
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
@@ -55,27 +68,33 @@ function App() {
 
   // --- DBリセット ---
   const handleResetDb = async () => {
-    if (!confirm("本当にすべての学習データを削除しますか？")) return;
+    const isConfirmed = await confirmDialog("本当にすべての学習データを削除しますか？\nこの操作は取り消せません。");
+    if (!isConfirmed) return;
+
     try {
       await resetDb();
-      addMessage({ 
-        sender: 'system', 
+      addMessage({
+        sender: 'system',
         text: "🗑️ データベースを初期化しました。",
         timestamp: new Date().toLocaleTimeString()
       });
+      addToast("データベースを初期化しました", 'success');
     } catch (e) {
-      alert("リセットに失敗しました");
+      addToast("リセットに失敗しました", 'error');
     }
   };
 
   // --- ドキュメント削除 ---
   const handleDeleteDocument = async (filename) => {
-    if (!confirm(`"${filename}" を削除しますか？`)) return;
+    const isConfirmed = await confirmDialog(`"${filename}" を削除しますか？`);
+    if (!isConfirmed) return;
+
     try {
       await deleteDocument(filename);
+      addToast(`"${filename}" を削除しました`, 'success');
     } catch (e) {
       console.error("Delete failed", e);
-      alert("削除エラー");
+      addToast("削除エラーが発生しました", 'error');
     }
   };
 
@@ -88,8 +107,9 @@ function App() {
   const handleSaveTitle = async () => {
     try {
       await updateTitle();
+      addToast("タイトルを更新しました", 'success');
     } catch (e) {
-      alert("更新エラー");
+      addToast("更新エラーが発生しました", 'error');
     }
   };
 
@@ -99,11 +119,13 @@ function App() {
   };
 
   const handleClearChat = async () => {
-    if (!confirm("チャット履歴を削除しますか？")) return;
+    const isConfirmed = await confirmDialog("チャット履歴を削除しますか？");
+    if (!isConfirmed) return;
     try {
       clearMessages();
+      addToast("チャット履歴を削除しました", 'info');
     } catch (e) {
-      alert("削除に失敗しました");
+      addToast("削除に失敗しました", 'error');
     }
   };
 
@@ -112,15 +134,17 @@ function App() {
     try {
       // サーバー側の履歴を削除して、AIのコンテキストをクリアする
       await resetSession();
-      
+
       // 画面上には区切り線となるメッセージを表示
-      addMessage({ 
-        sender: 'system', 
+      addMessage({
+        sender: 'system',
         text: "🧹 会話の文脈をリセットしました。新しい話題について質問してください。",
         timestamp: new Date().toLocaleTimeString()
       });
+      addToast("会話の文脈をリセットしました", 'info');
     } catch (e) {
       console.error("Reset context failed", e);
+      addToast("リセットに失敗しました", 'error');
     }
   };
 
@@ -139,7 +163,7 @@ function App() {
 
   return (
     <div className="fixed inset-0 flex h-[100dvh] w-full bg-gradient-to-br from-indigo-50 via-slate-50 to-blue-100 dark:from-slate-900 dark:via-slate-900 dark:to-slate-800 text-slate-800 dark:text-slate-100 font-sans overflow-hidden transition-colors duration-200">
-      
+
       <Sidebar
         isOpen={isSidebarOpen}
         onClose={() => setIsSidebarOpen(false)}
@@ -191,8 +215,8 @@ function App() {
               <h3 className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
                 <span className="text-xl">📄</span> {viewingDoc.title || viewingDoc.source}
               </h3>
-              <button 
-                onClick={() => setViewingDoc(null)} 
+              <button
+                onClick={() => setViewingDoc(null)}
                 className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-200 text-slate-400 transition-colors"
               >
                 ✕
@@ -203,16 +227,16 @@ function App() {
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">ファイル名</h4>
                 <p className="text-sm text-slate-700 dark:text-slate-300 font-mono bg-white/50 dark:bg-black/20 px-2 py-1 rounded border border-slate-200/50 dark:border-slate-700 inline-block">{viewingDoc.source}</p>
               </div>
-              
+
               <div className="flex flex-col h-full min-h-[200px]">
                 <div className="flex border-b border-slate-200/50 dark:border-slate-700/50 mb-2">
-                  <button 
+                  <button
                     onClick={() => setModalTab('summary')}
                     className={`px-4 py-2 text-sm font-bold transition-colors border-b-2 ${modalTab === 'summary' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'}`}
                   >
                     要約
                   </button>
-                  <button 
+                  <button
                     onClick={() => setModalTab('content')}
                     className={`px-4 py-2 text-sm font-bold transition-colors border-b-2 ${modalTab === 'content' ? 'border-indigo-500 text-indigo-600 dark:text-indigo-400' : 'border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'}`}
                   >

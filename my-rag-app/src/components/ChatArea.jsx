@@ -3,6 +3,7 @@ import { marked } from 'marked';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
 import * as api from '../api/client';
+import { useToast } from './ui/ToastContext';
 
 export default function ChatArea({
   messages,
@@ -36,12 +37,80 @@ export default function ChatArea({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading]);
 
-  // Syntax highlighting
+  // Syntax highlighting & Copy Button Injection
+  // Use a ref to track which blocks have been processed to avoid duplicate headers
+  const processedBlocksRef = useRef(new WeakSet());
+
   useEffect(() => {
-    document.querySelectorAll('pre code').forEach((block) => {
-      hljs.highlightElement(block);
-    });
-  }, [messages]);
+    const processCodeBlocks = () => {
+      document.querySelectorAll('pre code').forEach((block) => {
+        // Highlight
+        if (!block.classList.contains('hljs')) {
+          hljs.highlightElement(block);
+        }
+
+        // Check if already processed to prevent double injection
+        const pre = block.parentElement;
+        if (pre.querySelector('.code-header')) return;
+
+        // Create header
+        const header = document.createElement('div');
+        header.className = 'code-header flex justify-between items-center px-4 py-2 bg-slate-700/50 rounded-t-lg border-b border-white/10';
+
+        // Language label
+        const langClass = Array.from(block.classList).find(c => c.startsWith('language-'));
+        const lang = langClass ? langClass.replace('language-', '') : 'text';
+        const langSpan = document.createElement('span');
+        langSpan.className = 'text-xs text-slate-400 font-mono font-medium lowercase';
+        langSpan.textContent = lang;
+
+        // Copy button
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'text-xs text-slate-400 hover:text-white transition-colors flex items-center gap-1';
+        copyBtn.innerHTML = `
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          Copy
+        `;
+
+        copyBtn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(block.textContent);
+            copyBtn.innerHTML = `
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              Copied!
+            `;
+            copyBtn.classList.add('text-green-400');
+            setTimeout(() => {
+              copyBtn.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                Copy
+              `;
+              copyBtn.classList.remove('text-green-400');
+            }, 2000);
+          } catch (err) {
+            console.error("Copy failed", err);
+          }
+        });
+
+        header.appendChild(langSpan);
+        header.appendChild(copyBtn);
+
+        // Adjust pre styles (remove padding from pre and add to code, or specific styling)
+        pre.classList.add('relative', 'group', '!p-0', '!pt-0', '!overflow-hidden'); // Override prose styles
+        block.classList.add('!p-4', '!block', '!overflow-x-auto', 'pt-2'); // Add padding to code element
+
+        pre.insertBefore(header, block);
+      });
+    };
+
+    // Run immediately
+    processCodeBlocks();
+
+    // Also run after a short delay to catch any async renders
+    const timeoutId = setTimeout(processCodeBlocks, 100);
+
+    return () => clearTimeout(timeoutId);
+  }); // Run on every render to ensure headers are always present
 
   // Handle external input set
   useEffect(() => {
@@ -76,9 +145,16 @@ export default function ChatArea({
     setShowDocSelector(true);
   };
 
+  // Toast hook (assuming passed or imported, but here strictly replacing alert if possible, or using props? 
+  // Wait, I need to check if useToast is available here or if I should pass addToast prop from App.
+  // Ideally, ChatArea should use the context too.
+  // Let's import useToast here as well.
+
+  const { addToast } = useToast();
+
   const handleOpenDocSelector = () => {
     if (documents.length === 0) {
-      alert("ドキュメントが登録されていません。左のサイドバーからアップロードしてください。");
+      addToast("ドキュメントが登録されていません。左のサイドバーからアップロードしてください。", 'info');
       return;
     }
     setPendingQuestion(input);

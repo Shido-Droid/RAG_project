@@ -44,9 +44,53 @@ def add_document_to_kb(text: str, source: str, doc_metadata: Optional[Dict[str, 
     if doc_metadata is None:
         doc_metadata = {}
 
-    # Simple chunking
-    chunk_size = 600
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    # Recursive splitting with overlap
+    def recursive_split_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+        if not text:
+            return []
+        
+        # Split by logical delimiters
+        delimiters = ["\n\n", "\n", "。", "！", "？", ".", "!", "?", " "]
+        segments = [text]
+        
+        for d in delimiters:
+            new_segments = []
+            for s in segments:
+                if len(s) > chunk_size:
+                    # Split this segment further
+                    parts = s.split(d)
+                    # Re-attach delimiter (except split by space)
+                    if d != " ":
+                        parts = [p + d for p in parts[:-1]] + [parts[-1]]
+                    new_segments.extend([p for p in parts if p])
+                else:
+                    new_segments.append(s)
+            segments = new_segments
+        
+        # Recombine into chunks with overlap
+        final_chunks = []
+        current_chunk = ""
+        
+        for s in segments:
+            if len(current_chunk) + len(s) > chunk_size:
+                if current_chunk:
+                    final_chunks.append(current_chunk)
+                    # Start new chunk with overlap from end of previous
+                    overlap_len = min(len(current_chunk), overlap)
+                    current_chunk = current_chunk[-overlap_len:] + s
+                else:
+                    # Segment itself is too large, force split (should be rare due to recursive logic)
+                    final_chunks.append(s[:chunk_size])
+                    current_chunk = s[chunk_size:]
+            else:
+                current_chunk += s
+        
+        if current_chunk:
+            final_chunks.append(current_chunk)
+            
+        return final_chunks
+
+    chunks = recursive_split_text(text, chunk_size=500, overlap=100)
     
     ids = [f"{source}_part{i}_{int(time.time())}" for i in range(len(chunks))]
     
