@@ -44,9 +44,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 静的ファイルのパス設定
+# 静的ファイルのパス設定 (Project Root relative to scripts/rag_server.py)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+STATIC_DIR = os.path.join(PROJECT_ROOT, "static")
+TEMPLATES_DIR = os.path.join(PROJECT_ROOT, "templates")
 
 # staticディレクトリがない場合は作成（念のため）
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -64,6 +66,10 @@ def init_db():
                          sources TEXT)''')
 
 init_db()
+
+# Static Files Mounting
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # --- Request/Response Models ---
 class QueryRequest(BaseModel):
@@ -91,8 +97,8 @@ class QueryResponse(BaseModel):
 # --- Endpoints ---
 @app.get("/")
 async def read_root():
-    # index.html を返す
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    # templates/index.html を返す
+    return FileResponse(os.path.join(TEMPLATES_DIR, "index.html"))
 
 def get_pdf_sections(reader: PdfReader) -> List[tuple]:
     """PDFのアウトライン（しおり）からセクション情報を抽出する"""

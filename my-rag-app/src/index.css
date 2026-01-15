@@ -1,4 +1,94 @@
 @import "tailwindcss";
 
-/* VS Codeでエラーが出ることがありますが、Tailwind v4の正常な構文です */
 @variant dark (&:where(.dark, .dark *));
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    /* slate-300 */
+    border-radius: 3px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+    background: #334155;
+    /* slate-700 */
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+    /* slate-400 */
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+    background: #475569;
+    /* slate-600 */
+}
+
+/* Animations */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes slideUp {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes float {
+    0% {
+        transform: translateY(0px);
+    }
+
+    50% {
+        transform: translateY(-5px);
+    }
+
+    100% {
+        transform: translateY(0px);
+    }
+}
+
+.animate-fade-in {
+    animation: fadeIn 0.5s ease-out forwards;
+}
+
+.animate-slide-up {
+    animation: slideUp 0.4s ease-out forwards;
+}
+
+.animate-float {
+    animation: float 3s ease-in-out infinite;
+}
+
+/* Global Styles */
+body {
+    font-family: 'Inter', sans-serif;
+    @apply bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100;
+}
+
+code,
+pre {
+    font-family: 'Fira Code', monospace;
+}
