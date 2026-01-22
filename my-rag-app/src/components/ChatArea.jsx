@@ -28,6 +28,7 @@ export default function ChatArea({
   const [showDocSelector, setShowDocSelector] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState('');
   const [explanation, setExplanation] = useState(null); // { term, text, x, y }
+  const [feedbackState, setFeedbackState] = useState({}); // { [msgIndex]: 'good' | 'bad' }
 
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -131,8 +132,9 @@ export default function ChatArea({
   }, [input]);
 
   const handleSendClick = () => {
-    if (!input.trim() || isLoading) return;
-    onSend(input, difficulty);
+    const textToSend = input.trim();
+    if (!textToSend || isLoading) return;
+    onSend(textToSend, difficulty);
     setInput('');
   };
 
@@ -176,6 +178,28 @@ export default function ChatArea({
       setExplanation({ term, text: data.explanation, x: popupX, y });
     } catch (e) {
       setExplanation({ term, text: 'エラーが発生しました', x: popupX, y });
+    }
+  };
+
+  const handleFeedback = async (msg, index, rating) => {
+    if (feedbackState[index]) return; // Prevent double voting
+
+    try {
+      await fetch('http://localhost:8000/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: "unknown",
+          answer: msg.text,
+          rating: rating,
+          intent: msg.intent || "unknown"
+        })
+      });
+      setFeedbackState(prev => ({ ...prev, [index]: rating }));
+      addToast("フィードバックを送信しました", "success");
+    } catch (e) {
+      console.error("Feedback failed", e);
+      addToast("送信に失敗しました", "error");
     }
   };
 
@@ -315,7 +339,29 @@ export default function ChatArea({
                       })}
                     </div>
                   )}
-                  <span className="text-[10px] text-slate-400 dark:text-slate-500 mt-1.5 px-2 font-mono opacity-0 group-hover:opacity-100 transition-opacity">{msg.timestamp}</span>
+                  <span className="text-[10px] text-slate-400 dark:text-slate-500 mt-1.5 px-2 font-mono flex justify-between items-center">
+                    <span>{msg.timestamp}</span>
+                    {msg.sender !== 'user' && (
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleFeedback(msg, index, 'good')}
+                          className={`transition-colors ${feedbackState[index] === 'good' ? 'text-green-500 font-bold scale-110' : feedbackState[index] ? 'opacity-30 cursor-not-allowed' : 'hover:text-green-500'}`}
+                          disabled={!!feedbackState[index]}
+                          title="役に立った"
+                        >
+                          👍
+                        </button>
+                        <button
+                          onClick={() => handleFeedback(msg, index, 'bad')}
+                          className={`transition-colors ${feedbackState[index] === 'bad' ? 'text-red-500 font-bold scale-110' : feedbackState[index] ? 'opacity-30 cursor-not-allowed' : 'hover:text-red-500'}`}
+                          disabled={!!feedbackState[index]}
+                          title="役に立たなかった"
+                        >
+                          👎
+                        </button>
+                      </div>
+                    )}
+                  </span>
                 </div>
 
                 {msg.sender === 'user' && (

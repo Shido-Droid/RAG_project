@@ -6,9 +6,15 @@ from typing import List, Dict, Any, Optional
 from .config import CHROMA_PATH, EMBED_MODEL_NAME
 from .utils import log
 
-# Init models (may be slow)
-log(f"[DB] Loading embedding model: {EMBED_MODEL_NAME}")
-embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+# Embedding model (Lazy loading to speed up startup/reload)
+_embed_model = None
+
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        log(f"[DB] Loading embedding model: {EMBED_MODEL_NAME}")
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return _embed_model
 
 log(f"[DB] Connecting to ChromaDB at {CHROMA_PATH}")
 client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -16,7 +22,8 @@ collection = client.get_or_create_collection("rag_docs_e5")
 
 def search_chroma(query: str, n_results: int = 6) -> List[Dict]:
     try:
-        q_emb = embed_model.encode([f"query: {query}"])
+        model = get_embed_model()
+        q_emb = model.encode([f"query: {query}"])
         res = collection.query(query_embeddings=[q_emb[0]], n_results=n_results)
         
         documents = res.get("documents")
@@ -122,7 +129,8 @@ def add_document_to_kb(text: str, source: str, doc_metadata: Optional[Dict[str, 
     metadatas: List[Any] = [base_meta.copy() for _ in chunks]
     
     # Embedding
-    embeddings = embed_model.encode([f"passage: {c}" for c in chunks])
+    model = get_embed_model()
+    embeddings = model.encode([f"passage: {c}" for c in chunks])
     
     collection.add(
         ids=ids,

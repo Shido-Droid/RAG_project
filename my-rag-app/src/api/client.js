@@ -19,7 +19,7 @@ export const uploadFile = async (file, enableOcr) => {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('enable_ocr', enableOcr);
-  
+
   const res = await fetch(`${API_BASE}/upload`, {
     method: 'POST',
     body: formData,

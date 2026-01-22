@@ -4,7 +4,7 @@ import json
 import sqlite3
 import datetime
 from typing import List, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -26,8 +26,10 @@ from src.rag_app import (
     document_exists, 
     analyze_document_content, 
     update_document_title, 
+    update_document_title, 
     explain_term
 )
+from src.rag_app.feedback import log_feedback
 
 app = FastAPI(
     title="RAG Qwen Ultimate API",
@@ -93,6 +95,13 @@ class Source(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: List[Source]
+
+class FeedbackRequest(BaseModel):
+    question: str
+    answer: str
+    rating: str # "good" or "bad"
+    comment: str = ""
+    intent: str = "unknown"
 
 # --- Endpoints ---
 @app.get("/")
@@ -166,6 +175,26 @@ async def explain_endpoint(request: ExplainRequest):
     """専門用語の解説を生成して返します"""
     explanation = explain_term(request.term)
     return {"term": request.term, "explanation": explanation}
+
+@app.post("/api/feedback")
+async def feedback_endpoint(request: Request):
+    """ユーザーからのフィードバック(Good/Bad)を保存"""
+    data = await request.json()
+    try:
+        with open("evaluation_log.jsonl", "a", encoding="utf-8") as f:
+            log_entry = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "question": data.get("question"),
+                "answer": data.get("answer"),
+                "rating": data.get("rating"), # good/bad
+                "intent": data.get("intent")
+            }
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Feedback Error: {e}")
+        # フィードバックの失敗でユーザーを困らせないよう、エラーは握りつぶしつつログに残す
+        return {"status": "error", "message": str(e)}
 
 @app.post("/api/ask")
 async def ask_endpoint(request: QueryRequest):

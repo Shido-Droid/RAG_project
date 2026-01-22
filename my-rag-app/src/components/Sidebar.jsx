@@ -139,6 +139,9 @@ export default function Sidebar({
                           {doc.title || doc.source}
                         </div>
                         <div className="flex items-center gap-2 mt-1">
+                          {doc.source && doc.source !== doc.title && (
+                            <span className="text-[9px] text-slate-400 font-mono truncate max-w-[100px]" title={doc.source}>{doc.source}</span>
+                          )}
                           {doc.size && <span className="text-[10px] font-mono text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-900 px-1.5 rounded">{formatBytes(doc.size)}</span>}
                           {doc.keywords && <span className="text-[10px] text-slate-500 dark:text-slate-400 truncate max-w-[80px] opacity-70" title={doc.keywords}>{doc.keywords}</span>}
                         </div>

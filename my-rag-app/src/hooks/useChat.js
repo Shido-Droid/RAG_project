@@ -88,11 +88,11 @@ export const useChat = () => {
               return;
             } else if (data.type === 'answer' || data.type === 'sources') {
               if (!botMessageAdded) {
-                setMessages(prev => [...prev, { 
-                  sender: 'bot', 
-                  text: data.type === 'answer' ? data.content : '', 
-                  sources: data.type === 'sources' ? data.content : [], 
-                  timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+                setMessages(prev => [...prev, {
+                  sender: 'bot',
+                  text: data.type === 'answer' ? data.content : '',
+                  sources: data.type === 'sources' ? data.content : [],
+                  timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                 }]);
                 botMessageAdded = true;
                 setLoadingMessage('回答を生成中...');
@@ -120,7 +120,11 @@ export const useChat = () => {
       }
     } catch (error) {
       if (error.name !== 'AbortError') {
-        setMessages(prev => [...prev, { sender: 'bot', text: `エラーが発生しました: ${error.message}` }]);
+        setMessages(prev => [...prev, {
+          sender: 'bot',
+          text: `エラーが発生しました: ${error.message}`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        }]);
       }
     } finally {
       setIsLoading(false);

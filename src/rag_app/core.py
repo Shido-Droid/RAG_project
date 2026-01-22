@@ -2,17 +2,28 @@ import time
 import json
 import re
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Any, Optional
 
 from .config import (
     NUM_SEARCH_QUERIES, DDGS_MAX_PER_QUERY, CHARS_LIMIT, 
-    LM_SHORT_TIMEOUT, LM_TIMEOUT, AnswerMode
+    LM_SHORT_TIMEOUT, LM_TIMEOUT, AnswerMode,
+    HYBRID_ALPHA_DEFAULT, HYBRID_ALPHA_BY_INTENT,
+    RERANK_CHUNK_SIZE, RERANK_CHUNK_OVERLAP, RERANK_TOP_K,
+    RERANK_MAX_WEB_SOURCES
 )
 from .utils import log, safe_json_load, try_fast_path
-from .llm import lmstudio_chat
-from .scraper import extract_text, score_text_for_restaurant, score_text_for_spec
+from .llm import lmstudio_chat, generate_system_prompt
+from .scraper import (
+    extract_text, 
+    score_text_for_restaurant, 
+    score_text_for_spec,
+    score_text_for_news,
+    score_text_for_weather,
+    score_text_for_informational
+)
 from .search import ddgs_search_many, refine_queries_from_hits
-from .db import search_chroma, embed_model
+from .db import search_chroma, get_embed_model
 
 # -----------------------
 # Intent detection
@@ -20,19 +31,27 @@ from .db import search_chroma, embed_model
 def detect_search_intent(question: str, history: List[Dict] = []) -> str:
     # 1. Fast heuristics
     qlow = question.lower()
-    doc_tokens = ["このドキュメント", "この文書", "アップロード", "ファイル", "資料", "pdf", "要約", "抽出", "セクション", "章"]
+    doc_tokens = ["このドキュメント", "この文書", "アップロード", "ファイル", "資料", "pdf", "要約", "抽出", "セクション", "章", "ドキュメント内検索", "ドキュメント検索"]
     for tok in doc_tokens:
         if tok in qlow:
             log(f"[Intent] Heuristic match: '{tok}' -> document_qa")
             return "document_qa"
 
-    system = "Classify intent: informational / spec / factual / local_search / news / weather / document_qa / other"
+    system = (
+        "Classify intent into one of: informational / local_search / news / weather / document_qa / other\n\n"
+        "Definitions:\n"
+        "- document_qa: Questions explicitly about the *uploaded file content* (e.g., 'summarize this doc', 'what does section 3 say?'). If the user asks about a general topic that MIGHT be in the doc but doesn't explicitly reference 'this document', classify as 'informational'.\n"
+        "- informational: General knowledge questions, definitions, technical terms, or facts (e.g., 'who is X?', 'release date of Y', 'what is RAG?').\n"
+        "- news/weather: Questions about current events or weather.\n"
+        "- local_search: Questions about shops, restaurants, places.\n"
+        "- other: Greetings, chitchat."
+    )
     
     history_text = ""
     if history:
-        history_text = "会話履歴:\n" + "\n".join([f"- {h['role']}: {h['content']}" for h in history]) + "\n\n"
+        history_text = "Conversation History:\n" + "\n".join([f"- {h['role']}: {h['content']}" for h in history]) + "\n\n"
 
-    user = f"{history_text}ユーザーの質問（日本語）: {question}\n\nReturn one of: informational, local_search, news, weather, document_qa, other"
+    user = f"{history_text}User Question: {question}\n\nReturn ONLY the label."
     try:
         resp = lmstudio_chat(
             [{"role":"system","content":system},
@@ -41,7 +60,7 @@ def detect_search_intent(question: str, history: List[Dict] = []) -> str:
             temperature=0.0,
             timeout=LM_SHORT_TIMEOUT
         )
-        text = resp['choices'][0]['message']['content'].strip().lower()
+        text = resp.strip().lower()
         for t in ["informational","local_search","news","weather","document_qa","other"]:
             if t in text:
                 return t
@@ -54,7 +73,10 @@ def detect_search_intent(question: str, history: List[Dict] = []) -> str:
     info_tokens = ["なぜ", "どうやって", "いつ", "とは", "教えて", "標高", "定義", "意味"]
     spec_tokens = ["バージョン", "仕様", "対応", "api", "model", "release"]
     weather_tokens = ["天気", "予報", "気温", "雨", "晴れ", "台風", "気象"]
+    chat_tokens = ["こんにちは", "こんばんは", "おはよう", "ありがとう", "初めまして", "ようこそ", "調子はどう", "誰ですか", "名前は"]
 
+    if any(tok in qlow for tok in chat_tokens):
+        return "other"
     if any(tok in qlow for tok in weather_tokens):
         return "weather"
     if any(tok in qlow for tok in local_tokens):
@@ -83,7 +105,7 @@ def qwen_generate_search_queries(question: str, intent: str, history: List[Dict]
         extra_instruction = "- Prefer terms like '天気', '1時間ごと', '週間予報', '気象庁'."
     elif intent == "informational":
         sys_prompt = "You are a search-query generator for factual informational search (Japanese)."
-        extra_instruction = "- Use factual terms. Expand acronyms if ambiguous."
+        extra_instruction = "- Use factual terms. Expand acronyms if ambiguous. If the term refers to a famous AI model (e.g., Gemini), add 'Google' or 'AI' to disambiguate (e.g. 'Google Gemini')."
     else:
         sys_prompt = "You are a search-query generator for general informational search (Japanese)."
         extra_instruction = "- Use neutral factual keywords only."
@@ -103,7 +125,7 @@ def qwen_generate_search_queries(question: str, intent: str, history: List[Dict]
     messages = [{"role":"system","content":sys_prompt},{"role":"user","content":user}]
     try:
         resp = lmstudio_chat(messages=messages, max_tokens=160, temperature=0.0, timeout=LM_SHORT_TIMEOUT)
-        text = resp['choices'][0]['message']['content']
+        text = resp
         parsed = safe_json_load(text)
         if isinstance(parsed, list) and parsed:
             qs = [q.strip() for q in parsed if isinstance(q, str) and q.strip()]
@@ -144,50 +166,99 @@ def qwen_generate_search_queries(question: str, intent: str, history: List[Dict]
 # -----------------------
 # Context Helpers
 # -----------------------
-def collect_candidates(chroma_docs, scored_web, min_chars: int = 50):
+def collect_candidates(chroma_docs: List[Dict], scored_web: List[Dict], intent: str = "informational"):
+    """
+    Collect and chunk candidates for reranking.
+    """
     candidates = []
+    
+    # 1. Local Docs
     for item in chroma_docs:
         text = item.get("text", "").strip()
-        if len(text) < min_chars:
-            continue
+        if not text: continue
         meta = item.get("meta", {})
         title = meta.get("title") or meta.get("source") or "Local Document"
+        
+        # Local docs authority: lower it for neutral informational searches to let vector relevance/web info compete
+        # For informational, we want web to win if it's more relevant.
+        h_score = 1.0 if intent == "informational" else 4.0
+        
         candidates.append({
             "source": "chroma",
             "text": text,
+            "h_score": h_score / 5.0, # normalize to 0-1
             "meta": {"title": title, "url": meta.get("source")}
         })
 
+    # 2. Web Hits (Chunking)
     for item in scored_web:
-        text = (item.get("text") or "").strip()
-        if len(text) < min_chars:
-            continue
-        candidates.append({
-            "source": "web",
-            "text": text,
-            "meta": {"title": item.get("title"), "url": item.get("url")}
-        })
+        full_text = (item.get("text") or "").strip()
+        if not full_text: continue
+        
+        # Heuristic score from scraper (already 0-5.0 approx)
+        h_score_raw = item.get("score", 1.0)
+        h_score = min(h_score_raw / 5.0, 1.0) # normalize
+        
+        # Chunking for finer reranking
+        chunks = []
+        if len(full_text) > RERANK_CHUNK_SIZE * 1.5:
+            start = 0
+            while start < len(full_text):
+                end = start + RERANK_CHUNK_SIZE
+                chunk = full_text[start:end]
+                if len(chunk) > 100:
+                    chunks.append(chunk)
+                start += (RERANK_CHUNK_SIZE - RERANK_CHUNK_OVERLAP)
+        else:
+            chunks = [full_text]
+            
+        for chunk in chunks:
+            candidates.append({
+                "source": "web",
+                "text": chunk,
+                "h_score": h_score,
+                "meta": {"title": item.get("title"), "url": item.get("url")}
+            })
+            
     return candidates
 
-def rerank_candidates(question, candidates, top_k=8):
+def rerank_candidates(question: str, candidates: List[Dict], intent: str = "informational", top_k: int = RERANK_TOP_K):
     if not candidates:
         return []
-    q_emb = embed_model.encode([f"query: {question}"])[0]
-    ranked = []
+    
+    alpha = HYBRID_ALPHA_BY_INTENT.get(intent, HYBRID_ALPHA_DEFAULT)
+    log(f"[Rerank] Using hybrid alpha={alpha} for intent={intent}")
+    
+    model = get_embed_model()
+    q_emb = model.encode([f"query: {question}"])[0]
+    scored_candidates = []
+
+    # Batch encode for efficiency if many candidates
+    texts_to_embed = [f"passage: {c['text']}" for c in candidates if "emb" not in c]
+    if texts_to_embed:
+        embs = model.encode(texts_to_embed)
+        idx = 0
+        for c in candidates:
+            if "emb" not in c:
+                c["emb"] = embs[idx]
+                idx += 1
 
     for c in candidates:
-        if "emb" not in c:
-            c["emb"] = embed_model.encode([f"passage: {c['text'][:800]}"])[0]
-            
         emb = c["emb"]
-        score = float(
+        # Vector Similarity (0-1 approx)
+        v_score = float(
             np.dot(q_emb, emb) / 
             (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-8)
         )
-        ranked.append((score, c))
+        
+        # Hybrid Score
+        h_score = c.get("h_score", 0.2)
+        final_score = alpha * h_score + (1.0 - alpha) * v_score
+        scored_candidates.append((final_score, c))
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [c for _, c in ranked[:top_k]]
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    return [c for _, c in scored_candidates[:top_k]]
 
 def dedupe_by_similarity(candidates, threshold=0.92):
     deduped = []
@@ -237,20 +308,24 @@ def final_answer_pipeline(question: str, context: str, history: List[Dict] = [],
         )
     else:
         base_system = (
-            "あなたは与えられた情報のみに基づいて回答するアシスタントです。\n"
-            "日本語で回答してください。\n"
-            "以下の【検索された文脈】に含まれている情報だけを使って、質問に答えてください。\n"
-            "もし文脈の中に答えが全くない場合は、「提供された情報からは分かりません」とだけ答えてください。\n"
-            "【重要】回答の可読性を高めるため、以下のルールを守ってください：\n"
-            "1. 適切な見出し（###など）を使い、情報を構造化してください。\n"
-            "2. 箇条書きを積極的に使い、長文を避けてください。\n"
-            "3. 重要なキーワードは**太字**にしてください。\n"
-            "4. 回答に専門用語を含める場合は、必ずその用語を `[[専門用語]]` のように二重角括弧で囲ってください。"
+            "あなたは学生の学習を支援する、知識豊富で親切な先生です。\n"
+            "常に丁寧で、励ますような口調（「〜ですね」「〜ですよ」など）で日本語で話してください。\n"
+            "【振る舞いのルール】\n"
+            "1. **文脈がある場合**: 提供された【検索された文脈】（ドキュメントやWeb検索結果）に基づいて、学生に分かりやすく教えてください。\n"
+            "2. **文脈がない場合（雑談など）**: 挨拶や雑談（「こんにちは」「ありがとう」など）に対しては、検索結果がなくてもあなたの知識や社交性を使って自然に返答してください。「情報がありません」と冷たく突き放してはいけません。\n"
+            "3. **知識の補完と誤字訂正**: 質問に誤字（例：米津弦師）があっても、文脈中の正しい名称（例：米津玄師）を拾って柔軟に対応してください。\n"
+            "4. **情報の限界**: 明らかに文脈にもあなたの知識にもない専門的な事実については、正直に「手元の資料には載っていないようです」と伝えてください。\n"
+            "5. **情報の整合性**: 検索結果には、派生モデルやサードパーティのプレスリリースが含まれる場合があります。主語（「誰が」「何を」作ったか）を取り違えないよう注意してください。情報が矛盾する場合は、より信頼できると思われる情報源（公式ドキュメントや主要なWikiなど）を優先し、不確実な場合は併記してください。\n"
+            "6. **言語の統一（重要）**: 【検索された文脈】が外国語（中国語や英語）であっても、必ず**自然な日本語**に翻訳・要約して回答してください。原文の漢字（例：基座、储备、量化）をそのまま使わず、適切な日本語（例：ベースモデル、蓄積、量子化）に直してください。\n\n"
+            "【回答の可読性】\n"
+            "- 適切な見出し（###など）や箇条書きを使って整理してください。\n"
+            "- 重要なキーワードは**太字**にしてください。\n"
+            "- 専門用語には `[[用語]]` のように二重角括弧をつけてください。"
         )
         if difficulty == "easy":
-            system = base_system + "\n\n【回答スタイル: 初学者向け】\n専門用語はなるべく避け、初心者にもわかりやすい言葉で、丁寧に噛み砕いて説明してください。"
+            system = base_system + "\n\n【回答スタイル: 初学者向け】\n専門用語はなるべく避け、初心者にもわかりやすい言葉で、比喩などを使いながら優しく教えてあげてください。"
         elif difficulty == "professional":
-            system = base_system + "\n\n【回答スタイル: 専門的】\n専門用語を適切に使用し、簡潔かつ論理的に、実務的・専門的な観点から詳細に回答してください。"
+            system = base_system + "\n\n【回答スタイル: 専門的】\n先生として、より高度で実践的な視点から論理的に解説してください。"
         else:
             system = base_system
 
@@ -277,7 +352,7 @@ def final_answer_pipeline(question: str, context: str, history: List[Dict] = [],
 
     try:
         resp = _try_generate(context)
-        content = resp["choices"][0]["message"]["content"].strip()
+        content = resp.strip()
 
         failure_phrase = "提供された情報からは分かりません"
         if failure_phrase in content and len(content) > 50:
@@ -291,7 +366,7 @@ def final_answer_pipeline(question: str, context: str, history: List[Dict] = [],
             log("[Qwen] 400 Error detected. Retrying with shorter context...")
             try:
                 resp = _try_generate(context[:len(context)//2])
-                return resp["choices"][0]["message"]["content"].strip()
+                return resp.strip()
             except Exception as e2:
                 log("[Qwen] Retry failed:", e2)
         return "回答生成中にエラーが発生しました。"
@@ -320,7 +395,7 @@ def analyze_document_content(text: str) -> Dict[str, Any]:
             max_tokens=350,
             temperature=0.2
         )
-        content = resp["choices"][0]["message"]["content"].strip()
+        content = resp.strip()
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
@@ -341,7 +416,7 @@ def explain_term(term: str) -> str:
             temperature=0.2,
             timeout=LM_SHORT_TIMEOUT
         )
-        return resp["choices"][0]["message"]["content"].strip()
+        return resp.strip()
     except Exception as e:
         log(f"[Explain] Error: {e}")
         return "解説を取得できませんでした。"
@@ -358,25 +433,43 @@ def process_question(question: str, history: List[Dict] = [], difficulty: str = 
     intent = detect_search_intent(question, history)
     log(f"[Intent] {intent}")
 
-    log("=== STEP 1: Chroma 検索 ===")
-    chroma_docs = search_chroma(question, n_results=10)
-
-    if intent == "document_qa":
-        log("=== STEP 2 & 3: Web search skipped (document_qa) ===")
+    
+    if intent == "other":
+        log("=== Search skipped (conversational/other) ===")
         queries = []
         hits = []
+        chroma_docs = []
     else:
         log("=== STEP 2: 検索クエリ生成 ===")
         queries = qwen_generate_search_queries(question, intent, history, n=NUM_SEARCH_QUERIES)
         log("Generated queries:", queries)
 
-        log("=== STEP 3: ddgs wide search ===")
-        hits = ddgs_search_many(queries, per_query=DDGS_MAX_PER_QUERY)
+        log("=== STEP 3: 検索実行 (Chroma + Web) ===")
+        # Chroma 検索: 元の質問と生成されたクエリの両方を使用
+        all_search_terms = [question] + queries
+        chroma_docs = []
+        seen_ids = set()
+        for q_term in all_search_terms:
+            results = search_chroma(q_term, n_results=5)
+            for r in results:
+                # メタデータ内の ID または テキストのハッシュで重複排除
+                # ここでは簡易的にソースとテキストの組み合わせで判定
+                key = (r['meta'].get('source'), r['text'][:100])
+                if key not in seen_ids:
+                    seen_ids.add(key)
+                    chroma_docs.append(r)
+        
+        if intent == "document_qa":
+            log("=== Web search skipped (document_qa) ===")
+            hits = []
+        else:
+            log("=== ddgs wide search ===")
+            hits = ddgs_search_many(queries, per_query=DDGS_MAX_PER_QUERY)
 
-        if intent == "informational":
-            hits = hits[:5]
-        elif intent in ("local_search", "news", "recommendation", "weather"):
-            hits = hits[:10]
+            if intent == "informational":
+                hits = hits[:5]
+            elif intent in ("local_search", "news", "recommendation", "weather"):
+                hits = hits[:10]
 
     log("=== STEP 4: refine search ===")
     if intent in ("local_search", "news", "recommendation"):
@@ -400,52 +493,91 @@ def process_question(question: str, history: List[Dict] = [], difficulty: str = 
         unique_hits.append(h)
 
     scored = []
-    for h in unique_hits:
-        url = h.get("href","")
-        title = h.get("title","")
-        text = extract_text(url)
+    
+    # Helper for parallel fetch
+    def _fetch_content(h):
+        u = h.get("href", "")
+        return (h, extract_text(u))
 
-        if not text or len(text) < 50:
-            snippet = h.get("body", "")
-            if snippet and len(snippet) > 30:
-                text = f"{snippet}\n(Note: Full content fetch failed, using search snippet.)"
+    log(f"=== Parallel Fetch (max_workers=10) for {len(unique_hits)} hits ===")
+    
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_fetch_content, h) for h in unique_hits]
+        
+        for future in as_completed(futures):
+            try:
+                h, text = future.result()
+                url = h.get("href","")
+                title = h.get("title","")
 
-        if not text:
-            continue
+                if not text or len(text) < 50:
+                    snippet = h.get("body", "")
+                    if snippet and len(snippet) > 30:
+                        text = f"{snippet}\n(Note: Full content fetch failed, using search snippet.)"
 
-        if intent in ("spec", "factual", "informational", "weather"):
-            score = score_text_for_spec(text, title=title, url=url)
-        else:
-            score = score_text_for_restaurant(text, title=title, url=url)
+                if not text:
+                    continue
 
-        scored.append({
-            "title": title,
-            "url": url,
-            "text": text,
-            "score": score
-        })
+                # Intent-specific scoring
+                if intent == "news":
+                    score = score_text_for_news(text, title=title, url=url)
+                elif intent == "weather":
+                    score = score_text_for_weather(text, title=title, url=url)
+                elif intent == "local_search":
+                    score = score_text_for_restaurant(text, title=title, url=url)
+                elif intent == "spec":
+                    score = score_text_for_spec(text, title=title, url=url)
+                elif intent == "informational":
+                    score = score_text_for_informational(text, title=title, url=url)
+                elif intent == "document_qa":
+                    # For document_qa, use informational scoring as fallback
+                    score = score_text_for_informational(text, title=title, url=url)
+                else:
+                    # Default to informational scoring
+                    score = score_text_for_informational(text, title=title, url=url)
+
+                scored.append({
+                    "title": title,
+                    "url": url,
+                    "text": text,
+                    "score": score
+                })
+            except Exception as e:
+                log(f"[Parallel Fetch] Error processing hit: {e}")
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     
+    # Pre-filter: only chunk the top-N web sources based on heuristic score
+    scored_top = [s for s in scored if s.get("score", 0) > 0.5] # Remove extremely low quality only
+    scored_top = scored_top[:RERANK_MAX_WEB_SOURCES]
+    log(f"[Performance] Pre-filtering: {len(scored)} -> {len(scored_top)} sources for chunking.")
+    
     # STEP 6: summarize (collect/rerank)
-    candidates = collect_candidates(chroma_docs, scored)
-    ranked_candidates = rerank_candidates(question, candidates, top_k=20)
+    candidates = collect_candidates(chroma_docs, scored_top, intent=intent)
+    ranked_candidates = rerank_candidates(question, candidates, intent=intent, top_k=RERANK_TOP_K)
     ranked_candidates = dedupe_by_similarity(ranked_candidates)
-
-    sources = []
-    seen_urls = set()
-    for c in ranked_candidates:
-        url = c["meta"].get("url")
-        title = c["meta"].get("title")
-        if url and url not in seen_urls:
-            sources.append({"title": title, "url": url})
-            seen_urls.add(url)
 
     log("=== STEP 7: context build ===")
     context = build_context_from_candidates(ranked_candidates)
 
     # STEP 8: final answer
+    # STEP 8: final answer
     answer = final_answer_pipeline(question, context, history, intent=intent, difficulty=difficulty)
+
+    sources = []
+    seen_urls = set()
+    for c in ranked_candidates:
+        meta = c.get("meta", {})
+        url = meta.get("url")
+        if url:
+            if url not in seen_urls:
+                sources.append(meta)
+                seen_urls.add(url)
+        elif meta: # Local docs might not have URL but have title
+             sources.append(meta)
 
     log(f"\nTotal time: {time.time() - start_time:.1f}s")
     return {"answer": answer, "sources": sources}
+
+# Alias for cleaner naming in external scripts
+execute_rag_pipeline = process_question
